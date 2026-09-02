@@ -1,0 +1,3 @@
+interface:
+  display_name: "Reviewer Map"
+  short_description: "Build a human-first PR reading guide"
