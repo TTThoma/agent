@@ -1,74 +1,76 @@
 ---
 name: feature-workflow
-description: Orchestrate an issue or feature idea through decision-complete planning, implementation, verification, fresh-context reconstruction, intent comparison, reviewer mapping, human approval, and publication. Use when a change needs a reusable, evidence-backed workflow rather than a single coding pass.
+description: Take an issue or feature idea from intent to merged code under a fixed human attention budget, with risk-tiered gates, a shared decision log, evidence instead of code reading for routine changes, and patch-bound approvals. Use when a change needs a trustworthy, reviewable delivery workflow rather than a single coding pass, especially when several agent sessions work in parallel.
 ---
 
-# Feature Workflow
+# Feature Workflow (v2)
 
-Coordinate the work; do not impersonate every specialist in one undifferentiated pass. Each stage has one goal, explicit inputs, an inspectable output, and an exit gate. Preserve user authority at interactive and externally mutating gates.
+The scarce resource is the maintainer's attention, not agent time. Every stage exists either to (a) put a **decision** in front of the human in a form they can answer in under a minute, or (b) produce **evidence** that replaces reading code. Everything else is agent-internal and never shown.
 
-## Start or resume
+## The attention contract
 
-Interpret the invocation as one of:
+The human sees exactly three kinds of output. Templates and hard caps: [references/human-surfaces.md](references/human-surfaces.md).
 
-- **start** — a GitHub issue, local issue text, or feature idea begins a new run;
-- **resume** — continue the named or only active run from its first incomplete or stale stage;
-- **status** — report current, missing, and stale artifacts without changing code or external state.
+| Surface | When | Cap |
+|---|---|---|
+| **Brief** | once per run, before building | ≤100 lines; ≤3 open decisions |
+| **Review packet** | once per PR, posted on the PR | ≤60 lines, plus ≤400 must-read code lines (T2 only) |
+| **Digest** | orchestrator, once per attention burst | ≤3 decisions + human-only actions + one FYI line |
 
-Before starting, establish the repository root, base ref, current branch, clean/dirty state, and source request. Do not fetch, create an issue, create or switch branches, commit, push, open a PR, merge, deploy, or install dependencies unless the user has authorized that action. Prefer a dedicated branch or worktree so unrelated changes cannot contaminate the candidate.
+Rules for every message to the human:
 
-Use `scripts/workflow_state.py` for the run ledger when Python and Git are available. It stores artifacts under the worktree's Git metadata by default, so analytical outputs do not change the commit they describe:
+1. **At most 3 open decisions.** Rank by impact × uncertainty. The agent decides everything else, logs each in one line in the decision log, and lists it as vetoable.
+2. **Render concretely.** A decision shows its consequence: the actual rows, a calls → dollars table, a sample response, a diagram. An abstract option list gets rubber-stamped and reversed later.
+3. **Recommendation plus default-if-silent.** Each decision states what the agent will do if there is no answer by the next burst.
+4. **Long files are footnotes.** Never point at a file and expect it read.
+5. **Information and decisions never share a message.** Send an information-only update first (what happened, links, no questions). Then send the decisions on their own, through the host's question tool when one exists (AskUserQuestion in Claude Code). Never ask a question at the end of a status message.
 
-```text
-python3 <skill-dir>/scripts/workflow_state.py init --slug <slug> --source <issue-or-idea> --base-ref <base>
-python3 <skill-dir>/scripts/workflow_state.py status --slug <slug>
-python3 <skill-dir>/scripts/workflow_state.py record --slug <slug> --artifact <name> [--path <file>]
-```
+## Start, resume, status
 
-Use `--state-dir <path>` only when the user or repository has chosen a different artifact location. If the helper is unavailable, maintain the same fields and invalidation rules manually using [references/artifact-contracts.md](references/artifact-contracts.md).
+- **start**: a GitHub issue number or a few lines of idea begins a run. Read the project decision log first ([references/decision-log.md](references/decision-log.md)), then shape the work with the human (below).
+- **resume**: continue the first incomplete or stale stage of the named run.
+- **status**: report current, missing and stale stages without changing anything.
+
+The ledger records the shape stage's output as artifact `brief`.
+
+Ledger: `python3 <skill-dir>/scripts/workflow_state.py {init|status|record|classify|set-tier|invalidate|where} ...`. It stores state under the worktree's Git metadata. When `<repo>/.feature-workflow/tiers.json` exists, it also enforces the tier floor and the must-read budget.
+
+## Stages
+
+Execute in order and skip stages the run's tier does not require. Full contracts: [references/stage-contracts.md](references/stage-contracts.md). Tiers and split rules: [references/risk-tiers.md](references/risk-tiers.md).
+
+| Stage | T0 | T1 | T2 | Human sees |
+|---|---|---|---|---|
+| `shape`: rounds of ≤3 questions (scope → facts → breakdown), human-only actions, sub-issues; produces the brief | – | ✓ | ✓ | each round, then the Brief |
+| `build`: implementer in a worktree + ≤3 adversarial review rounds | ✓ | ✓ | ✓ | nothing |
+| `verification`: tests, conformance, invariants, live proof | ✓ | ✓ | ✓ | evidence table (in packet) |
+| `cold-read`: isolated reconstruction + intent comparison | – | – | ✓ | material findings, one line each (in packet) |
+| `packet`: review packet posted on the PR | ✓ | ✓ | ✓ | Packet |
+| `approval`: human approves the exact patch | – | ✓ | ✓ | one question |
+| `published`: merge/deploy behind the deploy gate | ✓ | ✓ | ✓ | deploy line (in packet) |
+
+The default tier is **T2** until the ledger's path classification says otherwise. The agent may never set a tier below the path floor.
 
 ## Operating rules
 
-1. Read [references/stage-contracts.md](references/stage-contracts.md) before executing or resuming a run. Execute stages in dependency order; a later stage never repairs an earlier failed gate by assumption.
-2. Inspect available skills once. Use the adapters in [references/skill-routing.md](references/skill-routing.md). Missing third-party skills are not permission to install them; use the documented fallback or report the missing capability.
-3. Interactive stages may end with questions instead of a file. Resume the same stage after the answers, and record its artifact only when the exit gate is met.
-4. The orchestrator owns persistence and state. Specialist skills return content; the orchestrator writes the artifact, adds identity metadata, and records it in the ledger.
-5. Keep planning intent away from the cold reader until reconstruction is complete. Fresh context is a process boundary, not a request to ignore visible conversation text.
-6. Treat any implementation or worktree change after verification as invalidating verification and every downstream artifact. Re-run ledger status after edits, commits, rebases, or base updates.
-7. A human approval applies only to the recorded candidate base/head. Never transfer approval to a different commit.
+1. **Human-only actions first.** In `shape`, list every key, payment method, top-up, account, legal/ToS check and spend cap the work needs, with exact amounts. Ask for all of them in the first message, not when blocked.
+2. **One decision channel.** Decisions live in the project decision log, not in chat or peer relays. Check the log before asking. Never re-ask a settled decision, and never act on a relayed decision that is not in the log.
+3. **Shared code has one owner and its own PR.** A vendor or feature PR never modifies a shared layer. Shared-code changes go in a separate T2 PR owned by the layer owner; the others wait or build against a merged base. Never stack on a peer session's unmerged branch.
+4. **Split before showing.** If `classify` reports must-read lines over budget, split the PR before writing the packet: shared change → vendor layer + one pilot → mechanical fan-out → fixtures.
+5. **Evidence over reading.** A T1 change is approvable only when the conformance suite and the relevant invariant tests pass and the live-proof table is filled. If that evidence cannot be produced, the change is T2.
+6. **Review rounds stop early.** Run adversarial review rounds until one finds nothing required, max 3. Only material findings (money, keys, data exposure, cross-provider behaviour) reach the human, one line each with the fix.
+7. **Approval binds to the patch, verification to the head.** A rebase that keeps the patch identical keeps the approval, but verification must re-run on the new head. Any patch change invalidates approval. Record approval outside chat ([references/trust-evidence.md](references/trust-evidence.md)).
+8. **Deploy is a separate line.** Merging may auto-deploy. The packet's deploy line states the ops prerequisites and whether a manual-merge hold is required. The agent never relies on "approve" to imply "ship".
+9. **Permissions.** Code edits inside the approved brief need no further consent. Once the brief is approved, filing its sub-issues, pushing to a draft PR, filing follow-up issues and posting packets are pre-authorized unless the user says otherwise. Merging, deploying, spending money, installing dependencies, deleting branches and force-pushing shared branches always need explicit consent.
 
-## Fresh-context boundary
+## Shaping
 
-For `reconstruction`, create a new non-forked, read-only subagent. Give it only the repository root, base SHA, head SHA, and the `understand-pr` instructions. Do not give it the issue, spec, PR body, planning transcript, commit messages, or author rationale.
+The `shape` stage builds the brief with the human over short rounds, not written once and handed over. Each round asks ≤3 questions and shows concrete consequences. Typical order: scope, goals and non-goals → research and probe → task breakdown with tiers. When the approved breakdown has 2 or more PRs, file each task as a sub-issue of the source issue, recording its owner, tier, must-read estimate and inherited decision ids. Later changes go through the decision log, not by rewriting issues. Details: [references/stage-contracts.md](references/stage-contracts.md).
 
-- In Codex, dispatch with no inherited turns (`fork_turns=none`) when supported.
-- In Claude Code, use a resumable `general-purpose` or custom subagent, not a conversation fork and not the one-shot Explore agent. Preload `understand-pr` when supported.
+## Orchestration
 
-The parent records the returned reconstruction. Then resume the same subagent for `intent-comparison`, supplying the approved spec and source request only after the initial reconstruction is fixed. If the host cannot provide an isolated resumable agent, stop and disclose that the independence gate cannot be guaranteed; do not silently run the cold read in the main context.
-
-## Candidate and review loop
-
-The candidate gate requires a clean worktree and a committed HEAD. Record `candidate` only when verification and intent comparison are current and all material discrepancies are resolved or explicitly accepted.
-
-Generate `reviewer-map` against that candidate. Open a draft PR only when authorized, then obtain human review. A requested code change routes back to implementation and invalidates `implementation` onward. Regenerate the downstream chain before asking for approval again.
-
-Before publication or merge, compare:
-
-- recorded candidate HEAD;
-- local HEAD;
-- remote branch HEAD;
-- PR head SHA, when applicable;
-- human-approved SHA.
-
-Stop on any mismatch. Publish or merge only through a host-specific tool the user has authorized. Record `published` only after the external result and commit identity are verified.
+The default mode is one session that orchestrates its own subagents (research, implementer, reviewer, cold reader). Use separate worker sessions only when the breakdown has 2 or more independent sub-issues with no shared files, and keep active workers at or below the packets the human can approve per sitting (about 3). With worker sessions, the orchestrator owns the decision log, the human-action queue, migration and sequence numbers, merge order and the digest. The human may talk to a worker directly about decisions inside that worker's sub-issue; the worker logs each answer at once. Details: [references/orchestration.md](references/orchestration.md).
 
 ## Completion report
 
-Report the run slug, source, base/head, current stage, artifacts and paths, verification result, unresolved decisions, stale outputs, and any external URLs. Distinguish:
-
-- **complete** — the authorized terminal action succeeded for the approved SHA;
-- **waiting** — an interactive or human gate needs a response;
-- **blocked** — a required capability or gate cannot be satisfied;
-- **in progress** — safe work remains and no response is currently required.
-
-Do not claim completion merely because code exists or a branch was pushed.
+Report the run, tier, base/head, patch id, current stage, packet URL, verification result, open decisions (≤3), and whether the deploy gate is open. **Complete** means the approved patch is merged and the deploy prerequisites are done. A pushed branch or an approval alone is not completion.
