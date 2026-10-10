@@ -2,7 +2,7 @@
 
 One log per project (a parent issue or a multi-PR initiative), not one per run. Every run reads it at start and writes to it through its owner. It is the only channel through which a decision becomes binding.
 
-The header names one owner session for the project, not per run. Every other session, including concurrent runs, sends rows to the owner. An owner change is itself a row (`owner: A → B`). When the owner session ends, the human names the next owner; until then rows queue in the sender's brief as pending, not as decisions. There is no second file: briefs, sub-issues and notes cite log ids and hold no decided rows. Evidence from a 2026 pilot: decision ids lived on a parent issue while rows went into a brief, and the two drifted apart.
+The header names one owner session for the project, not per run. Every other session, including concurrent runs, sends rows to the owner. An owner change is itself a row (`owner: A → B`). When the owner session ends, the human names the next owner; until then rows queue in the sender's brief as pending, not as decisions. There is no second file: briefs, sub-issues and notes cite log ids and hold no decided rows.
 
 ## Location
 

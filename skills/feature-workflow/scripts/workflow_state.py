@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -69,7 +70,9 @@ PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
 # Substituted values must stay inside these sets, so none can become an option, a path trick or shell syntax.
 VALUE_RES = {"pr": "[0-9]+", "sha": "[0-9a-f]{40,64}", "patch_id": "[0-9a-f]{40,64}", "date": "[0-9T:Z-]+",
-             "approver": r"[\w(][\w .:()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
+             "approver": r"[A-Za-z0-9_(][A-Za-z0-9_ .:()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
+GRANT_ROW_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+GRANT_MAX_SECONDS = 12 * 3600  # the longest delegation window (references/delegation.md)
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_RES is the guard
 IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
@@ -913,6 +916,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         raise WorkflowError(f"{artifact} requires --path")
     if artifact == "approval" and not args.approver:
         raise WorkflowError("approval requires --approver <name>")
+    if artifact == "approval":
+        check_approver(args.approver)
     if args.recorded_by is not None and not RECORDED_BY_RE.fullmatch(args.recorded_by):
         raise WorkflowError("--recorded-by must match [A-Za-z0-9._:-]{1,64}")
     if artifact != "packet" and (args.pr or args.project or args.skip_packet_check is not None):
@@ -1057,6 +1062,84 @@ def require_current(report: dict[str, Any], state: dict[str, Any], artifact: str
                             + "; ".join(blocked + gates + ([] if report["worktree_clean"] else ["worktree is dirty"])))
 
 
+def check_approver(name: str, delegated: bool = False) -> None:
+    """ASCII only (no homoglyphs); the `delegated` prefix is reserved for approve --grant."""
+    if not re.fullmatch(VALUE_RES["approver"], name):
+        raise WorkflowError(f"approver {name!r} must be ASCII letters, digits, space and . _ - ( ) ' :, "
+                            "not starting with a symbol")
+    lowered = name.lower()
+    if not delegated and (lowered.startswith("delegated") or "delegated:" in lowered):
+        raise WorkflowError("approver names starting with 'delegated' or holding 'delegated:' are reserved for "
+                            "approve --grant")
+
+
+def parse_utc(value: str, flag: str) -> datetime:
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(:\d{2})?Z", value or "")
+    if not match:
+        raise WorkflowError(f"{flag} must be a UTC time like 2026-01-31T09:00Z, got {value!r}")
+    return datetime.strptime(match.group(1) + (match.group(2) or ":00"), "%Y-%m-%dT%H:%M:%S").replace(
+        tzinfo=timezone.utc)
+
+
+def iso(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def delegated_approver() -> str:
+    raw = os.environ.get("FEATURE_WORKFLOW_SESSION") or socket.gethostname()
+    return "delegated:" + (re.sub(r"[^A-Za-z0-9._-]", "-", raw)[:40].strip("-.") or "session")
+
+
+def grant_request(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any] | None:
+    """The delegation grant this approve claims, checked against its window and the project config."""
+    if not args.grant:
+        if args.grant_at or args.grant_until or args.grant_merges:
+            raise WorkflowError("--grant-at, --grant-until and --grant-merges need --grant ROW")
+        return None
+    if args.approver:
+        raise WorkflowError("--approver is refused with --grant: a delegated approval is recorded as "
+                            "delegated:<session>")
+    if args.allow_skipped_packet_check:
+        raise WorkflowError("--allow-skipped-packet-check is refused with --grant")
+    if not GRANT_ROW_RE.fullmatch(args.grant):
+        raise WorkflowError(f"--grant must be a decision-log row id, got {args.grant!r}")
+    if not args.grant_at or not args.grant_until:
+        raise WorkflowError("--grant needs --grant-at (the human's message) and --grant-until")
+    at, until = parse_utc(args.grant_at, "--grant-at"), parse_utc(args.grant_until, "--grant-until")
+    now = datetime.now(timezone.utc)
+    if not at < until or (until - at).total_seconds() > GRANT_MAX_SECONDS:
+        raise WorkflowError(f"grant {args.grant}: the window must end after it starts and last at most "
+                            f"{GRANT_MAX_SECONDS // 3600} h")
+    if at > now:
+        raise WorkflowError(f"grant {args.grant}: --grant-at {iso(at)} is in the future")
+    if now > until:
+        raise WorkflowError(f"grant {args.grant}: delegation window closed at {iso(until)}")
+    if "{approver}" not in (config["approval_status"] or ""):
+        raise WorkflowError("a delegated approval needs an approval_status template that shows {approver}, so the "
+                            "status reads delegated")
+    if config["merge_mode"] == "bot" and not args.grant_merges:
+        raise WorkflowError("under merge_mode: bot approving merges; pass --grant-merges only if the human's grant "
+                            "said it includes merging")
+    return {"row": args.grant, "at": iso(at), "until": iso(until), "merges": bool(args.grant_merges)}
+
+
+def pin_grant(repo: Path, grant: dict[str, Any], write: bool) -> None:
+    """Grants are pinned repo-wide on first use; every later use must match exactly (no extension)."""
+    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    path = common / "feature-workflow" / "grants.json"
+    with ledger_lock(path):
+        grants = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        pinned = grants.get(grant["row"])
+        if pinned is not None:
+            if pinned != grant:
+                raise WorkflowError(f"grant {grant['row']} is pinned to at {pinned['at']} until {pinned['until']} "
+                                    f"merges {pinned['merges']}; a grant cannot change or be extended: log a new row")
+            return
+        if write:
+            grants[grant["row"]] = grant
+            path.write_text(json.dumps(grants, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def landing_plan(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str,
                  keys: tuple[str, ...]) -> tuple[dict[str, str], dict[str, list[str]], dict[str, Any]] | None:
     """Validate config and the values its templates use, and render every command; --dry-run prints them."""
@@ -1114,11 +1197,23 @@ def cmd_approve(args: argparse.Namespace) -> int:
     refuse_closed(state)
     report = evaluate(state, repo)
     require_current(report, state, "approval")
+    grant = grant_request(args, project_config(repo, args.project, report["base_sha"]))
+    approver = delegated_approver() if grant else args.approver
+    if not approver:
+        raise WorkflowError("approve needs --approver NAME, or --grant for a delegated approval")
+    check_approver(approver, delegated=bool(grant))
+    if args.expect_patch is not None:
+        if not re.fullmatch(r"[0-9a-f]{7,64}", args.expect_patch):
+            raise WorkflowError("--expect-patch must be at least 7 lowercase hex characters of a patch id")
+        if not report["patch_id"].startswith(args.expect_patch):
+            raise WorkflowError(f"patch is {report['patch_id'][:12]}, not the approved {args.expect_patch}; re-ask")
     skipped = (state["artifacts"]["packet"].get("packet_check") or {}).get("skipped")
     if skipped and not args.allow_skipped_packet_check:
         raise WorkflowError(f"the packet was recorded with --skip-packet-check ({skipped}); re-record it, or pass "
                             "--allow-skipped-packet-check")
-    plan = landing_plan(repo, args, report, args.approver, ("mark_ready", "approval_status"))
+    if grant:
+        pin_grant(repo, grant, write=not args.dry_run)
+    plan = landing_plan(repo, args, report, approver, ("mark_ready", "approval_status"))
     if plan is None:
         return 0
     values, steps, landing = plan
@@ -1143,10 +1238,14 @@ def cmd_approve(args: argparse.Namespace) -> int:
                  f"tier: {state['tier']}", f"source: {state['source']}"]
         lines += [f"{key}: {report[key]}" for key in ("base_sha", "head_sha", "patch_id")]
         lines += [f"generated_at: {values['date']}", "result: approved", "---",
-                  f"Approved by {args.approver} on PR {args.pr}; evidence: {args.evidence_url or 'the commands below'}."]
+                  f"Approved by {approver} on PR {args.pr}"
+                  + (f" under grant {grant['row']} ({grant['at']} to {grant['until']}, merges: {grant['merges']})"
+                     if grant else "")
+                  + f"; evidence: {args.evidence_url or 'the commands below'}."]
         lines += [f"- `{shlex.join(item['argv'])}` exit 0 {item['stdout']}".rstrip() for item in done]
         note.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        extra = {"approver": args.approver, "evidence_url": args.evidence_url, "pr": args.pr, "landing": landing,
+        extra = {"approver": approver, "grant": grant, "evidence_url": args.evidence_url, "pr": args.pr,
+                 "landing": landing, "expect_patch": args.expect_patch,
                  "commands": done, "checks_note": ci_note or None,
                  "allow_skipped_packet_check": bool(args.allow_skipped_packet_check)}
         emit(store(state, path, "approval", report, str(note), extra))
@@ -1198,6 +1297,10 @@ def cmd_carry(args: argparse.Namespace) -> int:
         raise WorkflowError("the approval has no recorded PR; approve with --pr first")
     if approval["pr"] != args.pr:
         raise WorkflowError(f"the approval is for PR {approval['pr']}, not {args.pr}")
+    grant = approval.get("grant")
+    if grant and datetime.now(timezone.utc) > parse_utc(grant["until"], "grant until"):
+        raise WorkflowError(f"re-approval needed: delegation window closed at {grant['until']} "
+                            f"(grant {grant['row']})")
     for sha in (approval["base_sha"], approval["head_sha"]):
         if not resolve_commit(repo, sha):
             raise WorkflowError(f"approved commit {sha} is not in this repository; re-approval needed")
@@ -1383,6 +1486,8 @@ def cmd_packet_check(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     repo, _, state = open_run(args)
     report = evaluate(state, repo)
+    approval = state["artifacts"].get("approval") or {}
+    report["grant"] = {**approval["grant"], "approver": approval["approver"]} if approval.get("grant") else None
     if args.json:
         emit(report)
     else:
@@ -1415,6 +1520,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             if name == "packet" and item.get("recorded_at") and not item.get("pr_checked"):
                 skipped += " [PR/CI not checked]"
             print(f"{name}{label}: {item['status']}{who}{skipped}" + (f" ({detail})" if detail else ""))
+        if report["grant"]:
+            grant = report["grant"]
+            print(f"grant: {grant['row']} ({grant['at']} to {grant['until']}, merges: {grant['merges']}) "
+                  f"used by {grant['approver']}")
         for carry in report["carries"]:
             print(f"carry r{carry['revision']}: patch {carry['from_patch_id'][:12]} -> {carry['patch_id'][:12]} at "
                   f"{carry['head_sha'][:12]}; only {', '.join(carry['changed_files']) or 'no files'} changed")
@@ -1537,7 +1646,16 @@ def build_parser() -> argparse.ArgumentParser:
         land.add_argument("--dry-run", action="store_true", help="run only the PR-head read; print the argv of "
                           "every other command and change nothing")
         if name == "approve":
-            land.add_argument("--approver", required=True, help="name of the human who approved")
+            land.add_argument("--approver", help="name of the human who approved (ASCII; refused with --grant)")
+            land.add_argument("--expect-patch", metavar="PREFIX", help="the patch id the human approved (>= 7 hex); "
+                              "refuse when the current patch differs")
+            land.add_argument("--grant", metavar="ROW", help="delegated approval under this decision-log grant row; "
+                              "recorded as delegated:<session> (references/delegation.md)")
+            land.add_argument("--grant-at", metavar="ISO_UTC", help="time of the human's grant message")
+            land.add_argument("--grant-until", metavar="ISO_UTC", help="end of the window, at most 12 h after "
+                              "--grant-at")
+            land.add_argument("--grant-merges", action="store_true", help="the human's grant included merging "
+                              "(required under merge_mode: bot)")
             land.add_argument("--evidence-url", help="the approval message or comment URL")
             land.add_argument("--allow-skipped-packet-check", action="store_true", help="approve a packet recorded "
                               "with --skip-packet-check; recorded in the approval")

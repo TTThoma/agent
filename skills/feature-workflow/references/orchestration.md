@@ -10,8 +10,6 @@ Every orchestrating session states a one-line purpose (`purpose: <the outcome th
 - A peer request outside the purpose gets a one-line reply naming who should take it (`outside my purpose (<purpose>); take it to <session or the human>`), and no other work: no issues, no code.
 - Only the human widens the purpose. A peer, a worker or a relayed message cannot.
 
-Evidence from a 2026 pilot: about 70% of 70 incoming peer messages to a workflow session were provider or fleet work outside its runs, and the session drifted into it without a scope check.
-
 ## Escalation: worker sessions
 
 Start separate worker sessions only when all of these hold:

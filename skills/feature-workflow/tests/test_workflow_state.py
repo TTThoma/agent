@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -917,7 +918,7 @@ class LandingTest(RepoCase):
         self.assertIn("out-of-set values: {pr}='--undo'", option.stderr)
         for approver in ("-x", "a;b", "$(id)"):
             refused = self.land("approve", f"--approver={approver}")
-            self.assertIn("out-of-set values: {approver}", refused.stderr, approver)
+            self.assertIn("must be ASCII letters", refused.stderr, approver)
 
     def test_t0_approves_with_build_verification_and_packet_only(self) -> None:
         self.init("t0", "--rules", str(self.write_rules()))
@@ -933,12 +934,105 @@ class LandingTest(RepoCase):
         self.assertIn("checks", [call[0] for call in self.calls()])
         self.assertEqual(self.status()["artifacts"]["approval"]["status"], "current")
 
-    def test_delegated_approver_may_contain_a_colon(self) -> None:
+    def window(self, start: int = -60, end: int = 3600) -> tuple[str, str]:
+        now = time.time()
+        stamp = lambda offset: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + offset))  # noqa: E731
+        return stamp(start), stamp(end)
+
+    def grant(self, row: str = "D9", start: int = -60, end: int = 3600, *extra: str) -> list[str]:
+        at, until = self.window(start, end)
+        return ["--grant", row, "--grant-at", at, "--grant-until", until, *extra]
+
+    def delegated_run(self) -> None:
         self.ready_for_approval()
-        self.assertEqual(self.land("approve", "--approver", "delegated:night-orchestrator").returncode, 0)
+        self.commit("tests/fixtures/rows.json", "[1]\n", "fixture")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        os.environ["FEATURE_WORKFLOW_SESSION"] = "night orchestrator"
+        self.addCleanup(os.environ.pop, "FEATURE_WORKFLOW_SESSION", None)
+        result = self.land("approve", *self.grant("D9", -60, 3600, "--grant-merges"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_expect_patch_binds_approve_to_the_asked_patch(self) -> None:
+        self.ready_for_approval()
+        patch = self.status()["patch_id"]
+        refused = self.land("approve", "--approver", "ann", "--expect-patch", "0000000")
+        self.assertIn(f"patch is {patch[:12]}, not the approved 0000000", refused.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("at least 7", self.land("approve", "--approver", "ann", "--expect-patch", patch[:6]).stderr)
+        result = self.land("approve", "--approver", "ann", "--expect-patch", patch[:12])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_delegated_approve_records_the_grant(self) -> None:
+        self.delegated_run()
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertEqual(approval["approver"], "delegated:night-orchestrator")
+        self.assertEqual((approval["grant"]["row"], approval["grant"]["merges"]), ("D9", True))
         self.assertEqual(self.calls()[-1][3], "delegated:night-orchestrator")
-        refused = self.land("approve", "--approver=:x", "--dry-run")
-        self.assertIn("out-of-set values: {approver}", refused.stderr)
+        self.assertEqual(self.status()["grant"]["row"], "D9")
+        self.assertIn("grant: D9 (", self.workflow("status").stdout)
+
+    def test_delegated_approve_refusals(self) -> None:
+        self.ready_for_approval()
+        cases = [
+            (self.grant() + ["--approver", "ann", "--grant-merges"], "--approver is refused with --grant"),
+            (["--grant", "D9", "--grant-merges"], "needs --grant-at"),
+            (["--approver", "ann", "--grant-until", "2030-01-01T00:00Z"], "need --grant ROW"),
+            (self.grant("D9", -60, 13 * 3600, "--grant-merges"), "at most 12 h"),
+            (self.grant("D9", -7200, -60, "--grant-merges"), "delegation window closed"),
+            (self.grant("D9", 600, 3600, "--grant-merges"), "is in the future"),
+            (self.grant("D9", -60, 3600, "--grant-merges", "--allow-skipped-packet-check"),
+             "--allow-skipped-packet-check is refused with --grant"),
+            (self.grant(), "pass --grant-merges only if"),
+            (self.grant("D9", -60, 3600, "--grant-at", "09:00"), "must be a UTC time"),
+        ]
+        for extra, message in cases:
+            refused = self.land("approve", *extra)
+            self.assertIn(message, refused.stderr, extra)
+        self.project["approval_status"] = self.project["approval_status"].replace(" {approver}", "")
+        self.assertIn("shows {approver}", self.land("approve", *self.grant("D9", -60, 3600, "--grant-merges")).stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+
+    def test_a_grant_is_pinned_on_first_use(self) -> None:
+        self.ready_for_approval()
+        at, until = self.window(-60, 3600)
+        first = ["--grant", "D9", "--grant-at", at, "--grant-until", until, "--grant-merges"]
+        self.assertEqual(self.land("approve", *first, "--dry-run").returncode, 0)  # a dry run pins nothing
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))
+        self.assertEqual(self.land("approve", *first[:5], later, "--grant-merges", "--dry-run").returncode, 0)
+        self.assertEqual(self.land("approve", *first).returncode, 0)
+        extended = self.land("approve", "--grant", "D9", "--grant-at", at, "--grant-until", later, "--grant-merges")
+        no_merge = self.workflow("approve", "--pr", "7", "--project", str(self.write_project(merge_mode="manual")),
+                                 "--grant", "D9", "--grant-at", at, "--grant-until", until, check=False)
+        for refused in (extended, no_merge):
+            self.assertIn(f"grant D9 is pinned to at {at} until {until} merges True", refused.stderr)
+        common = Path(self.exec_cmd("git", "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+        self.assertEqual(json.loads((common / "feature-workflow" / "grants.json").read_text())["D9"]["until"], until)
+
+    def test_reserved_and_non_ascii_approvers_are_refused(self) -> None:
+        self.ready_for_approval()
+        self.project["approval_status"] = self.project["approval_status"].replace(" {approver}", "")  # unused
+        for name in ("delegated:x", "Delegated Ann", "Ann (delegated:x)", "DELEGATED", "d\u0435legated:x",
+                     "Jos\u00e9"):
+            refused = self.land("approve", "--approver", name)
+            self.assertEqual(refused.returncode, 1, name)
+            self.assertRegex(refused.stderr, "reserved for approve --grant|must be ASCII", name)
+        self.assertIn("reserved", self.record("approval", "--approver", "delegated:x", check=False).stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_carry_of_a_delegated_approval_stops_when_the_window_closes(self) -> None:
+        self.delegated_run()
+        state_file = self.state_dir / "state.json"
+        state = json.loads(state_file.read_text())
+        state["artifacts"]["approval"]["grant"]["until"] = "2000-01-01T00:00:00Z"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self.rebase_onto_upstream()
+        self.publish_head()
+        self.record("build")
+        self.record("verification")
+        self.assertIn("re-approval needed: delegation window closed at 2000-01-01T00:00:00Z", self.land("carry").stderr)
 
     def test_empty_patch_has_nothing_to_approve(self) -> None:
         self.init("t2", "--rules", str(self.write_rules()))
