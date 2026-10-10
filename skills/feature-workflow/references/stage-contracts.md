@@ -41,8 +41,9 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 - For T2, "Read these lines" totals ≤ budget. If it does not fit, go back and split.
 
 ### approval
-- Ask one question. Record the approval with `--approver` and `--evidence-url`.
+- Ask one question. Record the approval with `approve --pr N --approver NAME`, which checks the PR head, sets the project's approval status and marks the PR ready (`landing.md`).
 - A requested change returns to `build`. The ledger invalidates packet and approval when the patch changes.
 
 ### published
+- Land per `landing.md`: one slow watcher, a single rerun for a flake, no reruns during an outage, `carry` after a conflict-only rebase.
 - Merging and deploying need explicit consent. Before merging, check heads, patch identity, what landed on base since approval, and ops prerequisites. Use a manual-merge hold when prerequisites are pending.

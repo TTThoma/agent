@@ -29,7 +29,7 @@ result: <draft|approved|pass|fail|accepted|rejected>
 |---|---|---|
 | brief | hash of the run's copy `brief.<revision>.md` (source path kept for reference) | the copy is edited |
 | build, verification | exact base + head, clean worktree | any commit, rebase or dirty tree |
-| cold-read, packet, approval, published | patch id of base..head, clean worktree | the patch changes; an identical-patch rebase leaves them current with a note |
+| cold-read, packet, approval, published | patch id of base..head, clean worktree | the patch changes; an identical-patch rebase leaves them current with a note, and a `carry` of the current approval moves cold-read, packet and approval to its new patch |
 
 Patch ids use `git patch-id --verbatim` when git supports it (2.40+), else `--stable`, which ignores whitespace; crossing that git version makes patch-bound artifacts stale once. Once the branch is merged into its base (merge-base == HEAD), artifacts are judged against the base recorded at build, and `published` needs `--remote-sha <merge commit>` on the base's first-parent line whose first-parent diff carries the approved patch id (HEAD itself after a fast-forward). A squash commit on that line with one parent and the approved patch id also publishes; its parent must descend from the build base, a checked-out branch must still carry the approved patch, and the run is then judged at the build's base and head and closed to further records. Merging the base into the branch before landing needs a fresh `build`.
 

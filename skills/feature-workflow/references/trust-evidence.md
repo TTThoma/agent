@@ -17,8 +17,8 @@ Local test runs are claims; CI runs are evidence. If the repository has no CI th
 
 ## Recording approval
 
-- Approval binds to the **patch id** of base..head (`git diff <base> <head> | git patch-id --stable`). A rebase that keeps the patch keeps the approval. Verification is bound to the exact head and must re-run after any rebase.
-- Record it outside chat. Use a GitHub review when the approver is not the PR author. Otherwise set a commit status on the head: `gh api repos/<o>/<r>/statuses/<sha> -f state=success -f context=maintainer-approval -f description="patch <id12> approved by <name>"`. Store the status or comment URL with `record --artifact approval --evidence-url`.
+- Approval binds to the **patch id** of base..head (`git diff <base> <head> | git patch-id --stable`). A rebase that keeps the patch keeps the approval; one that changes only skip-read files, with byte-identical must-read hunks, keeps it through `carry`. Verification is bound to the exact head and must re-run after any rebase, before a carry.
+- Record it outside chat with `approve --pr N --approver NAME [--evidence-url URL]`. It checks the PR head and runs the project's `approval_status` command, for example a commit status on the head or a review when the approver is not the PR author, and then records the approval ([landing.md](landing.md)). Use `record --artifact approval` by hand only where `approve` refuses by design, such as a patch that changes `.feature-workflow/`.
 - Before merge, compare the approved patch id, local head, remote head and PR head, and run "what landed on base since approval". If anything that landed touches the same modules, re-run verification and say so in the deploy line.
 
 ## Calibration
