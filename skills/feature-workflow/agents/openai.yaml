@@ -1,4 +1,4 @@
 interface:
   display_name: "Feature Workflow"
-  short_description: "Orchestrate an idea through review and delivery"
-  default_prompt: "Use $feature-workflow to take this feature from intent through an SHA-bound human review workflow."
+  short_description: "Deliver a feature within a fixed review budget"
+  default_prompt: "Use $feature-workflow to take this feature from intent to merge under a fixed human attention budget, with risk-tiered gates and patch-bound approval."
