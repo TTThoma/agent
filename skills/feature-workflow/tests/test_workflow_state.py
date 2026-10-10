@@ -1415,6 +1415,9 @@ class LandingTest(RepoCase):
                                                 {"name": "unit-tests", "bucket": "pass", "sha": self.head()}]),
                                     encoding="utf-8")
         self.assertEqual(self.packet_check(self.packet(), "--pr", "7").returncode, 0)
+        self.project["required_checks"] = []
+        self.checks_file.write_text(json.dumps([{"name": "e2e", "bucket": "pass", "sha": "0" * 40}]), encoding="utf-8")
+        self.assertIn("no checks reported for head", self.packet_check(self.packet(), "--pr", "7").stderr)
 
 BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
 BODY = "".join(f"    total = total + compute_value(item, {i})\n" for i in range(6))
