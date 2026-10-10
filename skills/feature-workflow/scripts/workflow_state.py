@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,6 +50,21 @@ DEFAULT_RULES = Path(".feature-workflow") / "tiers.json"
 # Branch-controlled .gitattributes (-diff, binary) and .gitmodules (ignore=all) must not hide content.
 DIFF_FLAGS = ("--text", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-M")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+# Project landing recipes (<repo>/.feature-workflow/project.json); a missing file or key takes these defaults.
+PROJECT_DEFAULTS: dict[str, Any] = {
+    "approval_status": None,
+    "mark_ready": "gh pr ready {pr}",
+    "pr_head": "gh pr view {pr} --json headRefOid -q .headRefOid",
+    "retrigger": None,
+    "required_checks": [],
+    "merge_mode": None,
+}
+TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger")
+MERGE_MODES = ("bot", "manual")
+PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
+PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
+CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
+HUNK_HEADER_RE = re.compile(rb"^@@ [^\n]*", re.M)
 
 
 class WorkflowError(RuntimeError):
@@ -209,16 +226,89 @@ def find_rules(repo: Path, explicit: str | None) -> Path | None:
         path = Path(explicit)
         return path.resolve() if path.is_file() else None
     name = origin_name(repo)
+    found = ancestor_config(repo, f"{name}.tiers.json") if name else None
+    fallback = repo / DEFAULT_RULES
+    return found or (fallback.resolve() if fallback.is_file() else None)
+
+
+def ancestor_config(repo: Path, filename: str) -> Path | None:
+    """The first `.feature-workflow/<filename>` in an ancestor of the worktree, outside the main checkout."""
     common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     main = common.parent.resolve() if common.name == ".git" else None
-    for directory in repo.parents if name else ():
+    for directory in repo.parents:
         if main and (directory == main or main in directory.parents):
             continue  # the main checkout's tree is branch-controlled too
-        candidate = directory / ".feature-workflow" / f"{name}.tiers.json"
+        candidate = directory / ".feature-workflow" / filename
         if candidate.is_file():
             return candidate.resolve()
-    fallback = repo / DEFAULT_RULES
-    return fallback.resolve() if fallback.is_file() else None
+    return None
+
+
+def find_project(repo: Path, explicit: str | None) -> Path | None:
+    """--project if given; else an ancestor `.feature-workflow/<origin-name>.project.json` (like the rules);
+    else the in-tree `.feature-workflow/project.json`, which the branch under review controls."""
+    if explicit:
+        path = resolve_in_repo(repo, explicit)
+        if not path.is_file():
+            raise WorkflowError(f"project config not found: {path}")
+        return path
+    name = origin_name(repo)
+    found = ancestor_config(repo, f"{name}.project.json") if name else None
+    fallback = repo / ".feature-workflow" / "project.json"
+    return found or (fallback.resolve() if fallback.is_file() else None)
+
+
+def load_project(path: Path | None) -> dict[str, Any]:
+    """Validate the project's landing recipes; JSON null switches a template off."""
+    config = {**PROJECT_DEFAULTS, "required_checks": [], "path": str(path) if path else None}
+    if path is None:
+        return config
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"invalid project config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise WorkflowError(f"invalid project config {path}: expected a JSON object")
+    unknown = sorted(key for key in data if key not in PROJECT_DEFAULTS and not key.startswith("_"))
+    if unknown:
+        raise WorkflowError(f"invalid project config {path}: unknown keys {', '.join(unknown)}")
+    for key in TEMPLATE_KEYS:
+        value = data.get(key, config[key])
+        if value is not None:
+            bad = sorted(set(PLACEHOLDER_RE.findall(value)) - set(PLACEHOLDERS)) if isinstance(value, str) else []
+            try:
+                if not isinstance(value, str) or not shlex.split(value) or bad:
+                    raise ValueError(f"unknown placeholders {bad}" if bad else "expected a non-empty string")
+            except ValueError as exc:
+                raise WorkflowError(f"invalid project config {path}: {key}: {exc}") from exc
+        config[key] = value
+    checks, mode = data.get("required_checks", []), data.get("merge_mode")
+    if not isinstance(checks, list) or not all(isinstance(check, str) for check in checks):
+        raise WorkflowError(f"invalid project config {path}: required_checks must be a list of names")
+    if mode is not None and mode not in MERGE_MODES:
+        raise WorkflowError(f"invalid project config {path}: merge_mode must be one of {', '.join(MERGE_MODES)}")
+    config.update({"required_checks": checks, "merge_mode": mode})
+    return config
+
+
+def render(template: str, values: dict[str, str]) -> list[str]:
+    """Split first, then fill placeholders per argument, so a value can never add or split arguments."""
+    def fill(match: re.Match[str]) -> str:
+        if match.group(1) not in values:
+            raise WorkflowError(f"placeholder {{{match.group(1)}}} has no value here")
+        return values[match.group(1)]
+    return [PLACEHOLDER_RE.sub(fill, token) for token in shlex.split(template)]
+
+
+def run_command(repo: Path, argv: list[str]) -> dict[str, Any]:
+    """Run one argv list, never through a shell."""
+    try:
+        proc = subprocess.run(argv, cwd=repo, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise WorkflowError(f"cannot run {shlex.join(argv)}: {exc}") from exc
+    if proc.returncode != 0:
+        raise WorkflowError(f"{shlex.join(argv)} exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
+    return {"argv": argv, "returncode": 0, "stdout": proc.stdout.strip()[-500:], "at": utc_now()}
 
 
 def load_rules(path: Path | None) -> tuple[dict[str, Any] | None, dict[str, str | None]]:
@@ -368,9 +458,24 @@ def write_state(path: Path, data: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def live_carry(state: dict[str, Any], patch: str | None = None) -> dict[str, Any] | None:
+    """The carry of the current approval, if it moved that approval to `patch` (to any patch when None)."""
+    carry, approval = state["artifacts"].get("carry"), state["artifacts"].get("approval")
+    if not carry or not approval or carry.get("invalidated") or carry["approval_revision"] != approval["revision"]:
+        return None
+    return carry if patch is None or carry["patch_id"] == patch else None
+
+
+def effective_patch(name: str, record: dict[str, Any], carry: dict[str, Any] | None) -> str | None:
+    if carry and name in CARRIED and record.get("patch_id") == carry["from_patch_id"]:
+        return carry["patch_id"]
+    return record.get("patch_id")
+
+
 def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None = None) -> dict[str, Any]:
     current = current or run_snapshot(repo, state)
     classified, gates = ruled(repo, state, current)
+    carry = live_carry(state, current["patch_id"])
     tier = state["tier"]
     required = REQUIRED[tier]
     statuses: dict[str, dict[str, Any]] = {}
@@ -404,8 +509,11 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         if name in HEAD_BOUND:
             moved.update(shifted)
         elif name in PATCH_BOUND:
-            if record.get("patch_id") != current["patch_id"]:
+            patch = effective_patch(name, record, carry)
+            if patch != current["patch_id"]:
                 reasons.add("patch changed")
+            elif carry and patch != record.get("patch_id"):
+                notes.add(f"approval carried: only {', '.join(carry['changed_files']) or 'no files'} changed")
             elif shifted:
                 notes.add(REBASED_NOTE)
         override = record.get("budget_override")
@@ -432,7 +540,7 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
                 # Patch-level dependency: a re-run on a new HEAD with the same patch still satisfies it.
                 if hard[dep]:
                     reasons.add(f"dependency {dep} is {dep_status}")
-                elif dep_record.get("patch_id") != record.get("patch_id"):
+                elif dep_record.get("patch_id") != effective_patch(name, record, carry):
                     reasons.add(f"dependency {dep} covers a different patch")
             elif dep not in recorded:
                 reasons.add(f"dependency {dep} was recorded after {name}")
@@ -451,6 +559,7 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
     return {
         "run": state["slug"],
         "source": state["source"],
+        "purpose": state.get("purpose"),
         "base_ref": state["base_ref"],
         "tier": tier,
         **current,
@@ -551,6 +660,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     state = {
         "schema_version": SCHEMA_VERSION, "slug": args.slug, "source": args.source, "repo_root": str(repo),
         "base_ref": args.base_ref, "tier": args.tier, "rules_path": rules_path, "rules_pin": pin,
+        "purpose": args.purpose,
         "created_at": now, "updated_at": now, "revision": 0,
         "initial_base_sha": current["base_sha"], "initial_head_sha": current["head_sha"],
         "artifacts": {}, "invalidations": [], "tier_changes": [], "rules_changes": [],
@@ -592,7 +702,9 @@ def squash_candidate(repo: Path, state: dict[str, Any], remote: str) -> tuple[st
 
 
 def approved_patch(state: dict[str, Any]) -> str:
-    return (state["artifacts"].get("approval") or state["artifacts"]["packet"])["patch_id"]
+    carry = live_carry(state)
+    record = carry or state["artifacts"].get("approval") or state["artifacts"]["packet"]
+    return record["patch_id"]
 
 
 def verify_merge(repo: Path, state: dict[str, Any], remote: str | None, report: dict[str, Any]) -> tuple[str, str]:
@@ -676,7 +788,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         raise WorkflowError(f"--remote-sha {args.remote_sha} does not match HEAD {report['head_sha']}"
                             + (f" and is not a squash landing: {not_squash}" if not_squash else ""))
 
-    resolved_path = digest = source = None
+    resolved_path = source = None
     if args.path:
         resolved = resolve_in_repo(repo, args.path)
         if not resolved.is_file():
@@ -687,37 +799,182 @@ def cmd_record(args: argparse.Namespace) -> int:
             os.close(fd)
             shutil.copyfile(source, temporary)
             os.replace(temporary, resolved)
-        resolved_path, digest = str(resolved), sha256_file(resolved)
+        resolved_path = str(resolved)
 
+    extra: dict[str, Any] = {"source_path": source} if artifact == "brief" else {}
+    if artifact == "approval":
+        extra.update({"approver": args.approver, "evidence_url": args.evidence_url})
+    if override:
+        override.update({"packet_revision": state["revision"] + 1, "at": utc_now()})
+        extra["budget_override"] = override
+        state.setdefault("budget_overrides", []).append(override)
+    if artifact == "published":
+        extra.update({"url": args.url, "remote_sha": args.remote_sha, "merged": report["merged"], "landing": landing})
+        if merge_patch:
+            extra.update({"remote_sha": merge_patch[0], "merge_patch_id": merge_patch[1]})
+    emit(store(state, path, artifact, report, resolved_path, extra))
+    return 0
+
+
+def store(state: dict[str, Any], path: Path, artifact: str, report: dict[str, Any], file_path: str | None,
+          extra: dict[str, Any]) -> dict[str, Any]:
     state["revision"] += 1
     entry: dict[str, Any] = {
         "revision": state["revision"],
         "recorded_at": utc_now(),
         "tier": state["tier"],
-        "path": resolved_path,
-        "sha256": digest,
+        "path": file_path,
+        "sha256": sha256_file(Path(file_path)) if file_path else None,
         "dependencies": {dep: state["artifacts"][dep]["revision"]
                          for dep in DEPENDENCIES[artifact] if dep in state["artifacts"]},
         "invalidated": False,
         "invalidation_reason": None,
     }
-    if artifact == "brief":
-        entry["source_path"] = source
-    else:
+    if artifact != "brief":
         entry.update({key: report[key] for key in ("base_sha", "head_sha", "patch_id")})
-    if artifact == "approval":
-        entry.update({"approver": args.approver, "evidence_url": args.evidence_url})
-    if override:
-        override.update({"packet_revision": state["revision"], "at": utc_now()})
-        entry["budget_override"] = override
-        state.setdefault("budget_overrides", []).append(override)
-    if artifact == "published":
-        entry.update({"url": args.url, "remote_sha": args.remote_sha, "merged": report["merged"], "landing": landing})
-        if merge_patch:
-            entry.update({"remote_sha": merge_patch[0], "merge_patch_id": merge_patch[1]})
+    entry.update(extra)
     state["artifacts"][artifact] = entry
     write_state(path, state)
-    emit(entry)
+    return entry
+
+
+def require_current(report: dict[str, Any], state: dict[str, Any], artifact: str) -> None:
+    """Every artifact before `artifact` that the tier requires (or that exists) must be current."""
+    statuses, required = report["artifacts"], REQUIRED[state["tier"]]
+    blocked = [f"{name} ({statuses[name]['status']}: {'; '.join(statuses[name]['reasons']) or 'not recorded'})"
+               for name in ARTIFACT_ORDER[:ARTIFACT_ORDER.index(artifact)]
+               if (name in required or statuses[name]["status"] != "absent") and statuses[name]["status"] != "current"]
+    gates = [gate["gate"] for gate in report["gates"] if artifact in gate["blocks"]]
+    if blocked or gates or not report["worktree_clean"]:
+        raise WorkflowError(f"cannot {'approve' if artifact == 'approval' else 'carry'}: "
+                            + "; ".join(blocked + gates + ([] if report["worktree_clean"] else ["worktree is dirty"])))
+
+
+def landing_values(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str) -> dict[str, str]:
+    return {"pr": args.pr, "sha": report["head_sha"], "patch_id": report["patch_id"], "approver": approver,
+            "date": utc_now(), "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
+
+
+def check_pr_head(repo: Path, config: dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
+    """The PR head (from the project's read-only `pr_head` command) must be the local HEAD."""
+    if not config["pr_head"]:
+        raise WorkflowError("project config switches pr_head off; approve and carry need the PR head")
+    result = run_command(repo, render(config["pr_head"], values))
+    if result["stdout"] != values["sha"]:
+        raise WorkflowError(f"local HEAD {values['sha']} is not the PR head {result['stdout'] or '(empty)'}; "
+                            "push or pull first")
+    return result
+
+
+def run_landing(repo: Path, args: argparse.Namespace, keys: tuple[str, ...], values: dict[str, str],
+                extra: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Check the PR head, then run the project's commands for `keys` in order; with --dry-run print them."""
+    config = load_project(find_project(repo, args.project))
+    head = check_pr_head(repo, config, values)
+    planned = [render(config[key], values) for key in keys if config[key]]
+    landing = {"project_config": config["path"], "pr_head": head["argv"], "merge_mode": config["merge_mode"],
+               "required_checks": config["required_checks"]}
+    if args.dry_run:
+        emit({"dry_run": True, **landing, "would_run": planned, "would_record": extra})
+        return None
+    done: list[dict[str, Any]] = []
+    for argv in planned:
+        try:
+            done.append(run_command(repo, argv))
+        except WorkflowError as exc:
+            ran = "; already ran: " + ", ".join(shlex.join(item["argv"]) for item in done) if done else ""
+            raise WorkflowError(f"{exc}{ran}; nothing was recorded") from exc
+    extra.update({"landing": landing, "commands": done})
+    return done
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    repo, path, state = open_run(args)
+    report = evaluate(state, repo)
+    require_current(report, state, "approval")
+    values = landing_values(repo, args, report, args.approver)
+    extra: dict[str, Any] = {"approver": args.approver, "evidence_url": args.evidence_url, "pr": args.pr}
+    done = run_landing(repo, args, ("approval_status", "mark_ready"), values, extra)
+    if done is None:
+        return 0
+    note = path.parent / f"approval.{state['revision'] + 1}.md"
+    lines = ["---", "workflow: feature-workflow/v2", f"run: {state['slug']}", "artifact: approval",
+             f"tier: {state['tier']}", f"source: {state['source']}"]
+    lines += [f"{key}: {report[key]}" for key in ("base_sha", "head_sha", "patch_id")]
+    lines += [f"generated_at: {values['date']}", "result: approved", "---",
+              f"Approved by {args.approver} on PR {args.pr}; evidence: {args.evidence_url or 'the commands below'}."]
+    lines += [f"- `{shlex.join(item['argv'])}` exit 0 {item['stdout']}".rstrip() for item in done]
+    note.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    emit(store(state, path, "approval", report, str(note), extra))
+    return 0
+
+
+def file_hunks(repo: Path, base: str, head: str, entry: dict[str, Any] | None) -> bytes:
+    """One file's patch without index, similarity and hunk-header lines: equal bytes mean the same hunks,
+    wherever a rebase moved them."""
+    if entry is None:
+        return b""
+    specs = [f":(literal){name}" for name in (entry["old_path"], entry["path"]) if name]
+    diff = git_bytes(repo, "-c", "core.quotePath=false", "diff", *DIFF_FLAGS, "--no-color", base, head, "--", *specs)
+    lines = [line for line in diff.split(b"\n")
+             if not line.startswith((b"index ", b"similarity index ", b"dissimilarity index "))]
+    return HUNK_HEADER_RE.sub(b"@@", b"\n".join(lines))
+
+
+def carry_diff(repo: Path, approval: dict[str, Any], current: dict[str, Any],
+               rules: dict[str, Any] | None) -> tuple[list[str], list[str], list[str]]:
+    """Files whose hunks differ between the approved and current patch: (must-read, other, skip-read)."""
+    before = {item["path"]: item for item in classify(repo, approval["base_sha"], approval["head_sha"], rules)["files"]}
+    after = {item["path"]: item for item in classify(repo, current["base_sha"], current["head_sha"], rules)["files"]}
+    must: list[str] = []
+    other: list[str] = []
+    skipped: list[str] = []
+    for name in sorted(before.keys() | after.keys()):
+        old, new = before.get(name), after.get(name)
+        if file_hunks(repo, approval["base_sha"], approval["head_sha"], old) == \
+                file_hunks(repo, current["base_sha"], current["head_sha"], new):
+            continue
+        entries = [item for item in (old, new) if item]
+        if any(item["tier"] == "t2" and not item["skip_read"] for item in entries):
+            must.append(name)
+        else:
+            (skipped if all(item["skip_read"] for item in entries) else other).append(name)
+    return must, other, skipped
+
+
+def cmd_carry(args: argparse.Namespace) -> int:
+    """D2: after a rebase, approval carries when the must-read hunks are byte-identical and every other changed
+    file is skip-read. Verification must already be re-recorded on the new head."""
+    repo, path, state = open_run(args)
+    approval = state["artifacts"].get("approval")
+    if not approval or approval.get("invalidated"):
+        raise WorkflowError("no approval to carry; run approve")
+    for sha in (approval["base_sha"], approval["head_sha"]):
+        if not resolve_commit(repo, sha):
+            raise WorkflowError(f"approved commit {sha} is not in this repository; re-approval needed")
+    current = run_snapshot(repo, state)
+    rules, _ = load_rules(find_rules(repo, state.get("rules_path")))
+    must, other, skipped = carry_diff(repo, approval, current, rules)
+    if must:
+        raise WorkflowError(f"re-approval needed: must-read changed in {', '.join(must)}")
+    if other:
+        raise WorkflowError(f"re-approval needed: {', '.join(other)} changed and not skip-read")
+    entry = {"revision": state["revision"] + 1, "recorded_at": utc_now(), "approval_revision": approval["revision"],
+             "from_patch_id": approval["patch_id"], "changed_files": skipped, "pr": args.pr, "invalidated": False,
+             **{key: current[key] for key in ("base_sha", "head_sha", "patch_id")}}
+    trial = copy.deepcopy(state)
+    trial["artifacts"]["carry"] = entry
+    report = evaluate(trial, repo, current)
+    require_current(report, trial, "published")  # build and verification must be re-recorded on the new head
+    values = landing_values(repo, args, report, approval["approver"])
+    if run_landing(repo, args, ("approval_status",), values, entry) is None:
+        return 0
+    state["revision"] += 1
+    state["artifacts"]["carry"] = entry
+    state.setdefault("carries", []).append(entry)
+    write_state(path, state)
+    print(f"carried approval for PR {args.pr} to {current['head_sha']}: "
+          + (f"only {', '.join(skipped)} changed" if skipped else "patch identical, no files changed"))
     return 0
 
 
@@ -728,6 +985,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         emit(report)
     else:
         print(f"run: {report['run']} (tier {report['tier']}); source: {report['source']}")
+        if report["purpose"]:
+            print(f"purpose: {report['purpose']}")
         print(f"base: {report['base_ref']} @ {report['base_sha']}")
         print(f"head: {report['head_sha']} (patch {report['patch_id']})"
               + (f"; merged into {report['base_ref']}" if report["merged"] else "")
@@ -828,6 +1087,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--tier", choices=TIERS, default="t2", help="risk tier (default t2, the safest)")
     init.add_argument("--resume", action="store_true", help="show existing run instead of failing")
     init.add_argument("--allow-dirty", action="store_true")
+    init.add_argument("--purpose", help="one line: the outcome this session delivers; status shows it")
     init.set_defaults(handler=cmd_init)
 
     record = subparsers.add_parser("record", help="record a completed artifact")
@@ -844,6 +1104,22 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--remote-sha", help="published: pushed SHA (must equal HEAD), or the merge commit "
                         "once the branch is merged (its first-parent diff must match the approved patch)")
     record.set_defaults(handler=cmd_record)
+
+    for name, handler, text in (("approve", cmd_approve, "check the PR head, set the approval status, mark the PR "
+                                 "ready and record the approval"),
+                                ("carry", cmd_carry, "after a rebase, carry the approval when only skip-read files "
+                                 "changed, and re-set the approval status on the new head")):
+        land = subparsers.add_parser(name, help=text)
+        add_common(land, rules=True)
+        land.add_argument("--pr", required=True, help="PR number or branch, as the project's commands take it")
+        land.add_argument("--project", help="project config (default: ancestor .feature-workflow/<origin-name>"
+                          ".project.json, else <repo>/.feature-workflow/project.json)")
+        land.add_argument("--dry-run", action="store_true", help="run only the PR-head read; print the argv of "
+                          "every other command and change nothing")
+        if name == "approve":
+            land.add_argument("--approver", required=True, help="name of the human who approved")
+            land.add_argument("--evidence-url", help="the approval message or comment URL")
+        land.set_defaults(handler=handler)
 
     status = subparsers.add_parser("status", help="evaluate missing and stale artifacts")
     add_common(status, rules=True)

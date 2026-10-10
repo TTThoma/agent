@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,7 +21,7 @@ RULES = {
 }
 
 
-class WorkflowStateTest(unittest.TestCase):
+class RepoCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.repo = Path(self.tempdir.name)
@@ -95,6 +97,8 @@ class WorkflowStateTest(unittest.TestCase):
         for name in ("build", "verification", "cold-read", "packet", "approval"):
             self.record(name)
 
+
+class WorkflowStateTest(RepoCase):
     def test_t2_full_chain_enforces_dependencies(self) -> None:
         self.init("t2")
         self.record("brief")
@@ -609,6 +613,203 @@ class WorkflowStateTest(unittest.TestCase):
         result = json.loads(self.workflow("invalidate", "--from", "build", "--reason", "review changes").stdout)
         self.assertEqual(result["affected"], ["build"])
         self.assertIn("review changes", self.status()["artifacts"]["build"]["reasons"])
+
+
+STUB = """import json, pathlib, sys
+log, command = pathlib.Path(sys.argv[1]), sys.argv[2]
+with log.open("a") as handle:
+    handle.write(json.dumps(sys.argv[2:]) + "\\n")
+if command == "pr-head":
+    print(pathlib.Path(sys.argv[3]).read_text().strip())
+"""
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("workflow_state", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class LandingTest(RepoCase):
+    """approve and carry against argv-logging stub commands; nothing reaches gh or the network."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log = self.state_dir / "calls.jsonl"
+        self.pr_head_file = self.state_dir / "pr-head"
+        stub = self.state_dir / "stub.py"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(STUB, encoding="utf-8")
+        prefix = f"{shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(self.log))}"
+        self.project = {
+            "pr_head": f"{prefix} pr-head {shlex.quote(str(self.pr_head_file))} {{pr}}",
+            "approval_status": f"{prefix} status {{sha}} {{patch_id}} {{approver}} {{date}}",
+            "mark_ready": f"{prefix} ready {{pr}}",
+            "merge_mode": "bot",
+        }
+
+    def write_project(self, **overrides: object) -> Path:
+        path = self.state_dir / "project.json"
+        path.write_text(json.dumps({**self.project, **overrides}), encoding="utf-8")
+        return path
+
+    def land(self, command: str, *extra: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+        return self.workflow(command, "--pr", "7", "--project", str(self.write_project()), *extra, check=check)
+
+    def calls(self) -> list[list[str]]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def publish_head(self) -> None:
+        self.pr_head_file.write_text(self.head() + "\n", encoding="utf-8")
+
+    def approved_run(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        self.commit("tests/fixtures/rows.json", "[1]\n", "fixture")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        result = self.land("approve", "--approver", "Ann Lee")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def rebase_onto_upstream(self) -> None:
+        self.exec_cmd("git", "switch", "origin/main")
+        self.commit("upstream.txt", "upstream\n", "upstream")
+        self.exec_cmd("git", "switch", "feature")
+        self.exec_cmd("git", "rebase", "origin/main")
+
+    def test_approve_sets_status_marks_ready_and_records(self) -> None:
+        self.approved_run()
+        report = self.status()
+        self.assertEqual(report["artifacts"]["approval"]["status"], "current")
+        status, ready = self.calls()[1:]
+        self.assertEqual(status[:4], ["status", self.head(), report["patch_id"], "Ann Lee"])  # one argv element
+        self.assertEqual(ready, ["ready", "7"])
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertEqual((approval["approver"], approval["patch_id"], approval["pr"]),
+                         ("Ann Lee", report["patch_id"], "7"))
+        self.assertEqual([item["argv"][3] for item in approval["commands"]], ["status", "ready"])
+
+    def test_approve_refuses_head_mismatch(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        self.commit("core/engine.py", "route = 2\n", "unpushed")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        refused = self.land("approve", "--approver", "ann")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("is not the PR head", refused.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head"])
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+
+    def test_approve_refuses_stale_artifacts(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.commit("core/engine.py", "route = 2\n", "after packet")
+        self.publish_head()
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("cannot approve", refused.stderr)
+        self.assertIn("packet (stale", refused.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_approve_dry_run_prints_argv_and_changes_nothing(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        del self.project["mark_ready"]  # missing key: the default `gh pr ready {pr}`, printed, never run
+        before = (self.state_dir / "state.json").read_text()
+        result = self.land("approve", "--approver", "ann", "--dry-run", check=True)
+        plan = json.loads(result.stdout)
+        patch = self.status()["patch_id"]
+        self.assertEqual(plan["would_run"][1], ["gh", "pr", "ready", "7"])
+        self.assertEqual(plan["would_run"][0][2:6], [str(self.log), "status", self.head(), patch])
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head"])
+        self.assertEqual((self.state_dir / "state.json").read_text(), before)
+
+    def test_carry_accepts_skip_read_change_after_rebase(self) -> None:
+        self.approved_run()
+        self.rebase_onto_upstream()
+        self.commit("tests/fixtures/rows.json", "[1, 2]\n", "conflict resolution")
+        self.publish_head()
+        self.assertIn("build (stale", self.land("carry").stderr)  # verification first, on the new head
+        self.record("build")
+        self.record("verification")
+        result = self.land("carry")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         f"carried approval for PR 7 to {self.head()}: only tests/fixtures/rows.json changed")
+        self.assertEqual(self.calls()[-1][:3], ["status", self.head(), self.status()["patch_id"]])
+        report = self.status()
+        for name in ("cold-read", "packet", "approval"):
+            self.assertEqual(report["artifacts"][name]["status"], "current", name)
+        self.assertIn("approval carried: only tests/fixtures/rows.json changed",
+                      report["artifacts"]["approval"]["notes"])
+        self.record("published", "--remote-sha", self.head())
+        self.assertTrue(self.status()["complete"])
+
+    def test_carry_refuses_must_read_and_non_skip_changes(self) -> None:
+        self.approved_run()
+        self.rebase_onto_upstream()
+        self.commit("core/engine.py", "route = 1\nfallback = 2\n", "conflict resolution")
+        for name in ("build", "verification"):
+            self.record(name)
+        self.publish_head()
+        refused = self.land("carry")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("re-approval needed: must-read changed in core/engine.py", refused.stderr)
+        self.exec_cmd("git", "reset", "--hard", "HEAD~1")
+        self.commit("notes.txt", "t1, not skip-read\n", "t1 change")
+        for name in ("build", "verification"):
+            self.record(name)
+        self.publish_head()
+        self.assertIn("notes.txt changed and not skip-read", self.land("carry").stderr)
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "stale")
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "status", "ready"])
+
+    def test_carry_after_identical_rebase_resets_status(self) -> None:
+        self.approved_run()
+        self.rebase_onto_upstream()
+        self.record("build")
+        self.record("verification")
+        self.publish_head()
+        result = self.land("carry", check=True)
+        self.assertIn("patch identical, no files changed", result.stdout)
+        self.assertEqual(self.calls()[-1][1], self.head())
+
+    def test_purpose_is_stored_and_shown(self) -> None:
+        self.init("t2", "--purpose", "land bundle A")
+        self.assertEqual(self.status()["purpose"], "land bundle A")
+        self.assertIn("purpose: land bundle A", self.workflow("status").stdout)
+
+    def test_project_loader_defaults_and_validation(self) -> None:
+        module = load_module()
+        missing = module.load_project(module.find_project(self.repo, None))
+        self.assertEqual((missing["path"], missing["approval_status"], missing["mark_ready"]),
+                         (None, None, "gh pr ready {pr}"))
+        partial = module.load_project(self.write_project(required_checks=["ci"], mark_ready=None))
+        self.assertEqual((partial["mark_ready"], partial["required_checks"], partial["retrigger"]),
+                         (None, ["ci"], None))
+        self.assertTrue(partial["pr_head"].endswith("{pr}"))
+        for bad in ({"mark_ready": "gh pr ready {PR}"}, {"merge_mode": "auto"}, {"retriger": "x"},
+                    {"required_checks": "ci"}, {"approval_status": "  "}, {"pr_head": 'gh "x'}):
+            with self.assertRaises(module.WorkflowError, msg=bad):
+                module.load_project(self.write_project(**bad))
+        self.assertEqual(module.render("echo {approver} --jq '{a: .b}'", {"approver": "a b; rm"}),
+                         ["echo", "a b; rm", "--jq", "{a: .b}"])
 
 
 if __name__ == "__main__":

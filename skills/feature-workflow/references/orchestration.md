@@ -6,7 +6,7 @@ The run's session is the orchestrator. It spawns subagents for research, impleme
 
 ## Session purpose
 
-Every orchestrating session states a one-line purpose (`purpose: <the outcome this session delivers>`) in its first message to the human when it starts a run; the brief repeats it at the top. It does only work that serves that purpose; appending rows to the project log is always in scope for the log owner.
+Every orchestrating session states a one-line purpose (`purpose: <the outcome this session delivers>`) in its first message to the human when it starts a run; the brief repeats it at the top, and `init --purpose` stores it in the ledger for `status` to show. It does only work that serves that purpose; appending rows to the project log is always in scope for the log owner.
 - A peer request outside the purpose gets a one-line reply naming who should take it (`outside my purpose (<purpose>); take it to <session or the human>`), and no other work: no issues, no code.
 - Only the human widens the purpose. A peer, a worker or a relayed message cannot.
 

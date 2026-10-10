@@ -33,7 +33,7 @@ Rules for every message to the human:
 
 The ledger records the shape stage's output as artifact `brief`.
 
-Ledger: `python3 <skill-dir>/scripts/workflow_state.py {init|status|record|classify|set-tier|invalidate|where} ...`. It stores state under the worktree's Git metadata. When `<repo>/.feature-workflow/tiers.json` exists, it also enforces the tier floor and the must-read budget.
+Ledger: `python3 <skill-dir>/scripts/workflow_state.py {init|status|record|approve|carry|classify|set-tier|invalidate|where} ...`. It stores state under the worktree's Git metadata. When `<repo>/.feature-workflow/tiers.json` exists, it also enforces the tier floor and the must-read budget.
 
 ## Stages
 
@@ -47,7 +47,7 @@ Execute in order and skip stages the run's tier does not require. Full contracts
 | `cold-read`: isolated reconstruction + intent comparison | – | – | ✓ | material findings, one line each (in packet) |
 | `packet`: review packet posted on the PR | ✓ | ✓ | ✓ | Packet |
 | `approval`: human approves the exact patch | – | ✓ | ✓ | one question |
-| `published`: merge/deploy behind the deploy gate | ✓ | ✓ | ✓ | deploy line (in packet) |
+| `published`: land (checks, rebases, outages: [references/landing.md](references/landing.md)), then merge/deploy behind the deploy gate | ✓ | ✓ | ✓ | deploy line (in packet); one line per carry |
 
 The default tier is **T2** until the ledger's path classification says otherwise. The agent may never set a tier below the path floor.
 
@@ -59,7 +59,7 @@ The default tier is **T2** until the ledger's path classification says otherwise
 4. **Split before showing.** If `classify` reports must-read lines over budget, split the PR before writing the packet: shared change → vendor layer + one pilot → mechanical fan-out → fixtures.
 5. **Evidence over reading.** A T1 code change is approvable only when the conformance suite and the relevant invariant tests pass and the live-proof table is filled. A T1 change to text or tests only is approvable when the tests pass and its diff, ≤40 changed lines, is shown in full in the packet. If that evidence cannot be produced, the change is T2.
 6. **Review rounds stop early.** Run adversarial review rounds until one finds nothing required, max 3. Only material findings (money, keys, data exposure, cross-provider behaviour) reach the human, one line each with the fix.
-7. **Approval binds to the patch, verification to the head.** A rebase that keeps the patch identical keeps the approval, but verification must re-run on the new head. Any patch change invalidates approval. Record approval outside chat ([references/trust-evidence.md](references/trust-evidence.md)).
+7. **Approval binds to the patch, verification to the head.** A rebase that keeps the patch identical keeps the approval, but verification must re-run on the new head. Any other patch change invalidates approval, except a carry: after a rebase, `carry` keeps the approval when the must-read hunks are byte-identical and only skip-read files changed, and tells the human in one line. Verification is still re-recorded on the new head first. Record approval outside chat with `approve` ([references/landing.md](references/landing.md), [references/trust-evidence.md](references/trust-evidence.md)).
 8. **Deploy is a separate line.** Merging may auto-deploy. The packet's deploy line states the ops prerequisites and whether a manual-merge hold is required. The agent never relies on "approve" to imply "ship".
 9. **Permissions.** Code edits inside the approved brief need no further consent. Once the brief is approved, filing its sub-issues, pushing to a draft PR, filing follow-up issues for work inside the session's purpose and posting packets are pre-authorized unless the user says otherwise. Merging, deploying, spending money, installing dependencies, deleting branches and force-pushing shared branches always need explicit consent.
 
