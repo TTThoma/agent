@@ -335,8 +335,11 @@ def load_project(path: Path | str | None, text: str | None = None) -> dict[str, 
     ready_at_packet = data.get("ready_at_packet", False)
     if not isinstance(ready_at_packet, bool):
         raise WorkflowError(f"invalid project config {path}: ready_at_packet must be true or false")
-    if ready_at_packet and not (config["mark_ready"] and config["pr_draft"]):
-        raise WorkflowError(f"invalid project config {path}: ready_at_packet needs mark_ready and pr_draft")
+    if ready_at_packet and not (config["mark_ready"] and config["pr_draft"] and config["approval_status"]
+                                and checks):
+        raise WorkflowError(f"invalid project config {path}: ready_at_packet needs mark_ready, pr_draft, an "
+                            "approval_status the merge mechanism waits for, and required_checks naming the check "
+                            "that runs only on a ready PR")
     config.update({"required_checks": checks, "merge_mode": mode, "ready_at_packet": ready_at_packet})
     return config
 
@@ -1494,13 +1497,22 @@ def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str],
     if not isinstance(rows, list) \
             or not all(isinstance(row, dict) and {"name", "bucket"} <= row.keys() for row in rows):
         return [f"cannot read checks from {shlex.join(argv)}: expected a list of {{name, bucket}}"], ""
+    required = config["required_checks"]
     if not rows:
+        if unreported is not None and required:  # ready_at_packet, packet time: a draft may run no CI at all
+            unreported.extend(required)
+            return [], ""
         return ["no checks reported; if the project has no CI, set checks to null in its config"], ""
-    required, entries = config["required_checks"], {}
+    head, entries = values.get("sha", ""), {}
     for row in rows:  # `gh pr checks` reads only the head commit's rollup and has no sha field; when a custom
-        if "sha" in row and str(row["sha"]) != values.get("sha"):  # command lists a sha, count only the head's
+        if "sha" in row and not head_sha(row["sha"], head):  # command lists one, count only the head's entries
             continue
-        entries.setdefault(str(row["name"]), []).append(str(row["bucket"]).lower())
+        bucket = str(row["bucket"]).lower()
+        if "neutral" in (bucket, str(row.get("state", "")).lower()):  # gh's own bucket for neutral is skipping
+            bucket = "skipping"
+        entries.setdefault(str(row["name"]), []).append(bucket)
+    if not entries:
+        return [f"no checks reported for head {head[:12]}"], ""
     missing = [name for name in required if name not in entries]
     if unreported is not None:
         unreported.extend(missing)
@@ -1522,6 +1534,11 @@ def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str],
             if worst:
                 problems.append(f"check {name} is {CHECK_STATES[worst]}")
     return problems, "; ".join(notes)
+
+
+def head_sha(value: object, head: str) -> bool:
+    """A check entry's sha names the head when it is >= 7 lowercase hex characters and a prefix of it."""
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{7,64}", value)) and head.startswith(value)
 
 
 def pr_values(repo: Path, config: dict[str, Any], pr: str, report: dict[str, Any],

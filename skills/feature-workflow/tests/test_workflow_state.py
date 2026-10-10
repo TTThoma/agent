@@ -1384,8 +1384,7 @@ class LandingTest(RepoCase):
         self.assertIn("cannot read the draft state", self.land("approve", "--approver", "ann",
                                                                "--allow-skipped-packet-check").stderr)
         module = load_module()
-        for bad in ({"ready_at_packet": "yes"}, {"ready_at_packet": True, "mark_ready": None},
-                    {"ready_at_packet": True, "pr_draft": None}):
+        for bad in ({"ready_at_packet": "yes"}, {"mark_ready": None}, {"pr_draft": None}):
             with self.assertRaises(module.WorkflowError, msg=bad):
                 module.load_project(self.write_project(**bad))
 
@@ -1418,6 +1417,59 @@ class LandingTest(RepoCase):
         self.project["required_checks"] = []
         self.checks_file.write_text(json.dumps([{"name": "e2e", "bucket": "pass", "sha": "0" * 40}]), encoding="utf-8")
         self.assertIn("no checks reported for head", self.packet_check(self.packet(), "--pr", "7").stderr)
+
+    def test_ready_at_packet_config_needs_status_and_required_checks(self) -> None:
+        module = load_module()
+        self.ready_at_packet_run()
+        self.assertTrue(module.load_project(self.write_project())["ready_at_packet"])
+        for bad in ({"approval_status": None}, {"required_checks": []},
+                    {"approval_status": None, "merge_mode": "manual"}):  # whatever the merge mode
+            with self.assertRaisesRegex(module.WorkflowError, "ready_at_packet needs", msg=bad):
+                module.load_project(self.write_project(**bad))
+        self.project["approval_status"] = None
+        self.assertIn("ready_at_packet needs", self.record_packet().stderr)
+        self.assertEqual(self.draft_file.read_text(), "true")
+
+    def test_check_entry_sha_must_name_the_head(self) -> None:
+        self.packet_run()
+        self.project["required_checks"] = ["unit-tests"]
+        head = self.head()
+        for rows, message in (
+                ([{"bucket": "fail", "sha": "0" * 40}], "no checks reported for head"),  # an old head's failure
+                ([{"bucket": "pass", "sha": head}, {"bucket": "fail", "sha": head[:7]}],
+                 "required check unit-tests is failing"),  # a short sha of the head counts
+                ([{"bucket": "pass", "sha": head[:6]}], "no checks reported for head"),
+                ([{"bucket": "pass", "sha": head[:7].upper()}], "no checks reported for head"),
+                ([{"bucket": "pass", "sha": ""}], "no checks reported for head"),
+                ([{"bucket": "pass", "sha": None}], "no checks reported for head"),
+                ([{"bucket": "pass", "sha": "zz" + head[2:]}], "no checks reported for head"),
+                ([{"bucket": "pass", "sha": head[:9]}, {"bucket": "NEUTRAL"}], None),
+                ([{"bucket": "pass"}, {"bucket": "skipping", "state": "neutral"}], None)):
+            self.checks_file.write_text(json.dumps([{"name": "unit-tests", **row} for row in rows]), encoding="utf-8")
+            result = self.packet_check(self.packet(), "--pr", "7")
+            if message is None:
+                self.assertEqual(result.returncode, 0, (rows, result.stderr))
+            else:
+                self.assertIn(message, result.stderr, rows)
+        self.record("packet")
+        self.checks_file.write_text(json.dumps([{"name": "unit-tests", "bucket": "pass", "sha": "0" * 40}]),
+                                    encoding="utf-8")
+        self.assertIn("no checks reported for head", self.land("approve", "--approver", "ann").stderr)
+
+    def test_ready_at_packet_tolerates_a_draft_with_no_ci_at_packet_only(self) -> None:
+        self.ready_at_packet_run()
+        self.checks_file.write_text("[]", encoding="utf-8")
+        self.project["ready_at_packet"] = False
+        self.assertIn("no checks reported;", self.record_packet().stderr)
+        self.project["ready_at_packet"] = True
+        recorded = self.record_packet()
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        packet = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["packet"]
+        self.assertEqual(packet["packet_check"]["unreported_required"], self.RELEASE)
+        self.assertEqual(self.draft_file.read_text(), "false")
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("cannot approve before CI is green: no checks reported;", refused.stderr)
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
 
 BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
 BODY = "".join(f"    total = total + compute_value(item, {i})\n" for i in range(6))
