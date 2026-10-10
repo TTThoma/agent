@@ -836,11 +836,6 @@ class LandingTest(RepoCase):
         for name in ("build", "verification", "cold-read", "packet"):
             self.record(name)
         self.publish_head()
-        option = self.workflow("approve", "--pr=--undo", "--approver", "ann", check=False)
-        self.assertIn("out-of-set values: {pr}='--undo'", option.stderr)
-        for approver in ("-x", "a;b", "$(id)"):
-            refused = self.workflow("approve", "--pr", "7", f"--approver={approver}", check=False)
-            self.assertIn("out-of-set values: {approver}", refused.stderr, approver)
         branch = self.workflow("approve", "--pr", "7", "--approver", "ann", "--dry-run", check=False)
         self.assertIn("this patch changes .feature-workflow/", branch.stderr)
         self.assertEqual(self.calls(), [])
@@ -860,6 +855,54 @@ class LandingTest(RepoCase):
         for name in ("build", "verification", "cold-read", "packet"):
             self.record(name)
         self.publish_head()
+
+    def test_in_tree_config_comes_from_the_base_commit(self) -> None:
+        self.exec_cmd("git", "switch", "-q", "origin/main")
+        self.commit(".feature-workflow/project.json", json.dumps(self.project), "project config")
+        base = self.head()
+        self.exec_cmd("git", "switch", "-q", "feature")
+        self.exec_cmd("git", "rebase", "-q", "origin/main")
+        self.ready_for_approval()
+        result = self.workflow("approve", "--pr", "7", "--approver", "ann")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertEqual(approval["landing"]["project_config"], f"{base}:.feature-workflow/project.json")
+
+    def test_untracked_config_hidden_by_gitignore_is_ignored(self) -> None:  # T2d
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        self.commit(".gitignore", ".feature-workflow/\n", "ignore the config dir")
+        evil = dict(self.project, mark_ready=self.project["mark_ready"].replace(" ready ", " evil "))
+        (self.repo / ".feature-workflow").mkdir()
+        (self.repo / ".feature-workflow" / "project.json").write_text(json.dumps(evil), encoding="utf-8")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        plan = json.loads(self.workflow("approve", "--pr", "7", "--approver", "ann", "--dry-run").stdout)
+        self.assertIsNone(plan["project_config"])
+        self.assertEqual(plan["would_run"]["mark_ready"], ["gh", "pr", "ready", "7"])
+        self.assertEqual(self.calls(), [])
+
+    def test_only_values_a_template_uses_are_checked(self) -> None:
+        self.exec_cmd("git", "switch", "-q", "-c", "feat+x")
+        self.ready_for_approval()
+        self.assertEqual(self.land("approve", "--approver", "ann", "--dry-run").returncode, 0)
+        self.project["mark_ready"] += " {head_ref}"
+        self.assertIn("{head_ref}='feat+x'", self.land("approve", "--approver", "ann", "--dry-run").stderr)
+        self.project["mark_ready"] = self.project["mark_ready"].removesuffix(" {head_ref}")
+        option = self.workflow("approve", "--pr=--undo", "--approver", "ann", "--project", str(self.write_project()),
+                               check=False)
+        self.assertIn("out-of-set values: {pr}='--undo'", option.stderr)
+        for approver in ("-x", "a;b", "$(id)"):
+            refused = self.land("approve", f"--approver={approver}")
+            self.assertIn("out-of-set values: {approver}", refused.stderr, approver)
+
+    def test_empty_patch_has_nothing_to_approve(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.assertIn("empty patch: nothing to approve", self.land("approve", "--approver", "ann").stderr)
 
     def test_approve_stops_when_pr_head_moves_after_mark_ready(self) -> None:
         self.ready_for_approval()
@@ -933,8 +976,10 @@ class LandingTest(RepoCase):
                          ["echo", "a b; rm", "--jq", "{a: .b}"])
         (self.repo / ".feature-workflow").mkdir()
         (self.repo / ".feature-workflow" / "project.json").symlink_to(self.write_project())
-        with self.assertRaisesRegex(module.WorkflowError, "symlink"):
-            module.find_project(self.repo, None)
+        self.exec_cmd("git", "add", ".feature-workflow")
+        self.exec_cmd("git", "commit", "-q", "-m", "symlinked config")
+        with self.assertRaisesRegex(module.WorkflowError, "not a regular file"):
+            module.project_config(self.repo, None, self.head())
 
 
 if __name__ == "__main__":

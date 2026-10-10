@@ -7,7 +7,7 @@ The land stage runs from approval to merge: record the approval, wait for requir
 Project-specific commands live with the project, not in the skill. The ledger looks for them in this order:
 1. `--project <path>`;
 2. the first ancestor `.feature-workflow/<origin-name>.project.json` outside the main checkout, next to `<origin-name>.tiers.json`;
-3. the in-tree `<repo>/.feature-workflow/project.json`. It is refused if it is a symlink or resolves outside the repository.
+3. the in-tree `.feature-workflow/project.json` as of the base commit, never the worktree copy, which the branch controls (it may be untracked behind a `.gitignore`). It is refused if it is not a regular file there.
 
 The branch under review controls everything in the tree, so `approve` and `carry` refuse while the patch adds, changes or deletes any path under `.feature-workflow/`. Land such a change on its own and record its approval by hand (`record --artifact approval`).
 
@@ -18,23 +18,23 @@ Every key is optional. A missing file or key takes the default, and JSON `null` 
 | `pr_head` | `gh pr view {pr} --json headRefOid -q .headRefOid` | read-only command that prints the PR head SHA |
 | `mark_ready` | `gh pr ready {pr}` | takes the PR out of draft |
 | `approval_status` | none | sets the approval record the merge bot or reviewer reads, e.g. `gh api repos/<o>/<r>/statuses/{sha} -f state=success -f context=maintainer-approval -f "description=patch {patch_id} approved by {approver}"` |
-| `required_checks` | `[]` | check names that must pass before merge. Recorded with each approval and carry; `packet-check` uses them |
+| `required_checks` | `[]` | check names that must pass before merge. Recorded with each approval and carry |
 | `retrigger` | none | re-requests a required check for the current head, e.g. a rerun of a dispatch workflow for `{head_ref}` `{sha}` |
 | `merge_mode` | none | `bot` (a merge bot lands it once checks and status are green) or `manual` (the human merges). Recorded with each approval and carry |
 
-Placeholders, each with a fixed character set; a value outside its set is refused before anything runs:
+Placeholders, each with a fixed character set. A value outside its set is refused before anything runs, but only when a template that will run uses it:
 - `{pr}`: digits;
 - `{sha}` (local HEAD) and `{patch_id}`: hex;
 - `{approver}`: letters, digits, space and `. _ - ( ) '`;
 - `{head_ref}` (current branch): `A-Z a-z 0-9 . _ / -`;
 - `{date}`: UTC timestamp.
 
-A template is split with `shlex` first and then filled per argument, so no value can add or split arguments. Any other `{word}` is refused as a typo; braces with spaces or colons, as in a jq filter, pass through unchanged. Never wrap a template in a shell: a template that runs `sh`, `bash`, `zsh`, `dash` or `ksh` with `-c` is refused. Keys starting with `_` are comments; other unknown keys are refused.
+A template is split with `shlex` first and then filled per argument, so no value can add or split arguments. Any other `{word}` is refused as a typo; braces with spaces or colons, as in a jq filter, pass through unchanged. Never wrap a template in a shell. A template that runs `sh`, `bash`, `zsh`, `dash` or `ksh` with `-c` is refused, but that denylist is a convenience; the value sets are the guard. Keys starting with `_` are comments; other unknown keys are refused.
 
 ## Commands
 
 - **`workflow_state.py approve --slug S --pr N --approver NAME [--evidence-url URL] [--dry-run]`**
-  - Refuses unless the run is open, every artifact before approval is current, no gate blocks approval, the worktree is clean, the patch leaves `.feature-workflow/` alone, and `pr_head` equals the local HEAD.
+  - Refuses unless the run is open, the patch is not empty, every artifact before approval is current, no gate blocks approval, the worktree is clean, the patch leaves `.feature-workflow/` alone, and `pr_head` equals the local HEAD.
   - Runs `mark_ready`, checks `pr_head` again, and then takes the ledger lock. Under the lock it re-loads and re-evaluates the run, refusing if approval is no longer allowed on the same head and patch. Only then does it run `approval_status` and record `approval`, with the approver, patch id, PR, project config, `merge_mode`, `required_checks`, and each command's argv and output.
   - On a failure before `approval_status`, no approval status is left behind. If `approval_status` itself fails, nothing is recorded except an `approval_attempts` entry, which never counts as an approval.
 - **`workflow_state.py carry --slug S --pr N [--dry-run]`**, after a rebase (rule 7):

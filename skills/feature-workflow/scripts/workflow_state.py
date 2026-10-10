@@ -68,7 +68,8 @@ PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
 # Substituted values must stay inside these sets, so none can become an option, a path trick or shell syntax.
 VALUE_RES = {"pr": "[0-9]+", "sha": "[0-9a-f]{40,64}", "patch_id": "[0-9a-f]{40,64}", "date": "[0-9T:Z-]+",
              "approver": r"[\w(][\w .()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
-SHELLS = ("sh", "bash", "zsh", "dash", "ksh")
+SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_RES is the guard
+IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
 HUNK_HEADER_RE = re.compile(rb"^@@ [^\n]*", re.M)
 
@@ -251,30 +252,38 @@ def ancestor_config(repo: Path, filename: str) -> Path | None:
 
 
 def find_project(repo: Path, explicit: str | None) -> Path | None:
-    """--project if given; else an ancestor `.feature-workflow/<origin-name>.project.json` (like the rules);
-    else the in-tree `.feature-workflow/project.json`, which the branch under review controls."""
+    """--project if given; else an ancestor `.feature-workflow/<origin-name>.project.json` (like the rules)."""
     if explicit:
         path = resolve_in_repo(repo, explicit)
         if not path.is_file():
             raise WorkflowError(f"project config not found: {path}")
         return path
     name = origin_name(repo)
-    found = ancestor_config(repo, f"{name}.project.json") if name else None
-    fallback = repo / ".feature-workflow" / "project.json"
-    if found or not (fallback.is_file() or fallback.is_symlink()):
-        return found
-    if fallback.is_symlink() or repo not in fallback.resolve().parents:
-        raise WorkflowError(f"{fallback} is a symlink or resolves outside the repository; refusing it")
-    return fallback.resolve()
+    return ancestor_config(repo, f"{name}.project.json") if name else None
 
 
-def load_project(path: Path | None) -> dict[str, Any]:
+def project_config(repo: Path, explicit: str | None, base_sha: str) -> dict[str, Any]:
+    """The found config, else the in-tree one as of the base commit: the worktree copy is the branch's
+    (it may even be untracked behind a .gitignore)."""
+    found = find_project(repo, explicit)
+    if found:
+        return load_project(found)
+    entry = run_git(repo, "ls-tree", base_sha, "--", IN_TREE_PROJECT)
+    if not entry:
+        return load_project(None)
+    if not entry.startswith("100"):
+        raise WorkflowError(f"{IN_TREE_PROJECT} at base {base_sha} is not a regular file; refusing it")
+    text = git_bytes(repo, "show", f"{base_sha}:{IN_TREE_PROJECT}").decode("utf-8", errors="replace")
+    return load_project(f"{base_sha}:{IN_TREE_PROJECT}", text)
+
+
+def load_project(path: Path | str | None, text: str | None = None) -> dict[str, Any]:
     """Validate the project's landing recipes; JSON null switches a template off."""
     config = {**PROJECT_DEFAULTS, "required_checks": [], "path": str(path) if path else None}
     if path is None:
         return config
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8") if text is None else text)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WorkflowError(f"invalid project config {path}: {exc}") from exc
     if not isinstance(data, dict):
@@ -893,25 +902,23 @@ def require_current(report: dict[str, Any], state: dict[str, Any], artifact: str
                             + "; ".join(blocked + gates + ([] if report["worktree_clean"] else ["worktree is dirty"])))
 
 
-def landing_values(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str) -> dict[str, str]:
-    values = {"pr": args.pr, "sha": report["head_sha"], "patch_id": report["patch_id"], "approver": approver,
-              "date": utc_now(), "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
-    bad = [f"{{{key}}}={value!r}" for key, value in values.items() if not re.fullmatch(VALUE_RES[key], value)]
-    if bad:
-        raise WorkflowError(f"refusing to run commands with out-of-set values: {', '.join(bad)}")
-    return values
-
-
 def landing_plan(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str,
                  keys: tuple[str, ...]) -> tuple[dict[str, str], dict[str, list[str]], dict[str, Any]] | None:
-    """Validate values and config and render every command; with --dry-run print them, run nothing."""
-    values = landing_values(repo, args, report, approver)
+    """Validate config and the values its templates use, and render every command; --dry-run prints them."""
+    if report["patch_id"] == "empty":
+        raise WorkflowError("empty patch: nothing to approve")
+    values = {"pr": args.pr, "sha": report["head_sha"], "patch_id": report["patch_id"], "approver": approver,
+              "date": utc_now(), "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
     if run_git(repo, "diff", "--name-only", "--no-renames", report["base_sha"], values["sha"], "--", ".feature-workflow"):
         raise WorkflowError("this patch changes .feature-workflow/, whose rules and commands approve and carry trust; "
                             "land it on its own, approved with record --artifact approval")
-    config = load_project(find_project(repo, args.project))
+    config = project_config(repo, args.project, report["base_sha"])
     if not config["pr_head"]:
         raise WorkflowError("project config switches pr_head off; approve and carry need the PR head")
+    used = {name for key in ("pr_head", *keys) if config[key] for name in PLACEHOLDER_RE.findall(config[key])}
+    bad = [f"{{{key}}}={values[key]!r}" for key in sorted(used) if not re.fullmatch(VALUE_RES[key], values[key])]
+    if bad:
+        raise WorkflowError(f"refusing to run commands with out-of-set values: {', '.join(bad)}")
     steps = {key: render(config[key], values) for key in ("pr_head", *keys) if config[key]}
     landing = {"project_config": config["path"], "merge_mode": config["merge_mode"],
                "required_checks": config["required_checks"]}
@@ -1200,7 +1207,7 @@ def build_parser() -> argparse.ArgumentParser:
                                  "changed, and re-set the approval status on the new head")):
         land = subparsers.add_parser(name, help=text)
         add_common(land)  # no --rules: a re-pin would write state, even under --dry-run
-        land.add_argument("--pr", required=True, help="PR number or branch, as the project's commands take it")
+        land.add_argument("--pr", required=True, help="PR number (digits only)")
         land.add_argument("--project", help="project config (default: ancestor .feature-workflow/<origin-name>"
                           ".project.json, else <repo>/.feature-workflow/project.json)")
         land.add_argument("--dry-run", action="store_true", help="run only the PR-head read; print the argv of "
