@@ -14,7 +14,7 @@ The human sees exactly three kinds of output. Templates and hard caps: [referenc
 | Surface | When | Cap |
 |---|---|---|
 | **Brief** | once per run, before building | ≤100 lines; ≤3 open decisions |
-| **Review packet** | once per PR, posted on the PR | ≤60 lines, plus ≤400 must-read code lines (T2 only) |
+| **Review packet** | once per PR, posted on the PR | ≤60 lines (T0: ≤3 lines), plus ≤400 must-read code lines (T2 only) |
 | **Digest** | orchestrator, once per attention burst | ≤3 decisions + human-only actions + one FYI line |
 
 Rules for every message to the human:
@@ -46,8 +46,11 @@ Execute in order and skip stages the run's tier does not require. Full contracts
 | `verification`: tests, conformance, invariants, live proof | ✓ | ✓ | ✓ | evidence table (in packet) |
 | `cold-read`: isolated reconstruction + intent comparison | – | – | ✓ | material findings, one line each (in packet) |
 | `packet`: review packet posted on the PR | ✓ | ✓ | ✓ | Packet |
-| `approval`: human approves the exact patch | – | ✓ | ✓ | one question |
+| `approval`: human approves the exact patch, or a delegated approval under a logged grant² | status only¹ | ✓ | ✓ | one question; T0/T1 batch up to 5 |
 | `published`: land (checks, rebases, outages: [references/landing.md](references/landing.md)), then merge/deploy behind the deploy gate | ✓ | ✓ | ✓ | deploy line (in packet); carry notices in the digest |
+
+¹ T0 runs `approve` only where the merge mechanism requires an approval status: one click. Merging still needs consent under rule 9 unless `merge_mode: bot`. Details: [references/risk-tiers.md](references/risk-tiers.md).
+² Opt-in, for a window the human states: [references/delegation.md](references/delegation.md).
 
 The default tier is **T2** until the ledger's path classification says otherwise. The agent may never set a tier below the path floor.
 
@@ -61,7 +64,7 @@ The default tier is **T2** until the ledger's path classification says otherwise
 6. **Review rounds stop early.** Run adversarial review rounds until one finds nothing required, max 3. Only material findings (money, keys, data exposure, cross-provider behaviour) reach the human, one line each with the fix.
 7. **Approval binds to the patch, verification to the head.** A rebase that keeps the patch identical keeps the approval, but verification must re-run on the new head. Any other patch change invalidates approval, except a carry: after a rebase, `carry` keeps the approval when the must-read hunks are byte-identical and only skip-read files changed, with a one-line notice in the next digest or on the PR. Verification is still re-recorded on the new head first. Record approval outside chat with `approve` ([references/landing.md](references/landing.md), [references/trust-evidence.md](references/trust-evidence.md)).
 8. **Deploy is a separate line.** Merging may auto-deploy. The packet's deploy line states the ops prerequisites and whether a manual-merge hold is required. The agent never relies on "approve" to imply "ship", except under a project's `merge_mode: bot`, where `approve` can trigger the merge: the approval question then says "approving merges", and the answer counts as merge consent. A carry under bot mode can merge the carried patch; that is allowed only because its must-read hunks are identical (rule 7), and the carry notice says "this will merge".
-9. **Permissions.** Code edits inside the approved brief need no further consent. Once the brief is approved, filing its sub-issues, pushing to a draft PR, filing follow-up issues for work inside the session's purpose and posting packets are pre-authorized unless the user says otherwise. Marking a PR ready as part of `approve` is pre-authorized by that approval. Merging, deploying, spending money, installing dependencies, deleting branches and force-pushing shared branches always need explicit consent.
+9. **Permissions.** Code edits inside the approved brief need no further consent. Once the brief is approved, filing its sub-issues, pushing to a draft PR, filing follow-up issues for work inside the session's purpose and posting packets are pre-authorized unless the user says otherwise. Marking a PR ready as part of `approve` is pre-authorized by that approval. Merging, deploying, spending money, installing dependencies, deleting branches and force-pushing shared branches always need explicit consent. A delegation grant, logged from the human's own message, is that consent only for approving the PRs its rubric admits during its window, and for merging them only when the grant says so ([references/delegation.md](references/delegation.md)).
 
 ## Shaping
 

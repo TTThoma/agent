@@ -4,9 +4,9 @@ The tier decides which stages run and what the human reads. The run's tier is ne
 
 | Tier | Typical content | Human reads | Gate |
 |---|---|---|---|
-| **T0 mechanical** | docs, recorded fixtures, pure moves/renames, fan-out rows of an approved template | nothing; packet is FYI | verification green + classifier confirms T0 |
-| **T1 pattern** | new adapter/site/meter row following an existing, conformance-tested pattern; price rows that follow a recorded pricing rule | packet only, no code (text/tests: the full diff, ≤40 lines) | code: conformance + invariants + live proof green; text/tests: tests green; human approves packet |
-| **T2 core** | shared layers, billing/metering semantics, keys/auth/secrets, routing/failover, migrations, global caps or request policies, anything that changes behaviour of every provider | packet + ≤400 must-read lines | cold-read done, must-read within budget, human approves patch |
+| **T0 mechanical** | docs, recorded fixtures, pure moves/renames, fan-out rows of an approved template | a packet of ≤3 lines, FYI | verification green + classifier confirms T0; no approval stage, unless the merge mechanism requires an approval status: then one click |
+| **T1 pattern** | new adapter/site/meter row following an existing, conformance-tested pattern; price rows that follow a recorded pricing rule | packet only, no code (text/tests: the full diff, ≤40 lines) | code: conformance + invariants + live proof green; text/tests: tests green; human approves packet, up to 5 per batch question |
+| **T2 core** | shared layers, billing/metering semantics, keys/auth/secrets, routing/failover, migrations, global caps or request policies, anything that changes behaviour of every provider | packet + ≤400 must-read lines | cold-read done, must-read within budget, human approves patch, or a delegated approval under a logged grant ([delegation.md](delegation.md)) |
 
 Generated mirrors of prices or permissions are T2: the row is the change. A lockfile-only change floors T2 with nothing to read, so its packet lists every version change instead.
 
@@ -55,6 +55,32 @@ Must-read may exclude only lines that cannot change behaviour, so every changed 
 - a file renamed into a must-read path from a lower tier or a skip-read path counts in full, even unchanged: nobody read it at that tier. A rename between must-read paths counts only its changed lines.
 
 Whitespace-only and formatting changes are not excluded: a trailing space after a shell `\`, a blank line in a triple-quoted string or a YAML `|` block, and a space in a SQL literal all change behaviour. Any doubt in parsing git's output leaves the raw count. A budget override recorded before this rule stores the old count, so it no longer matches; overrides are per run, so an in-flight run re-records its packet.
+
+## Approval per tier
+
+- **T0:** a packet of ≤3 lines: the title line, what changed with an evidence link, and the deploy line (`human-surfaces.md`). The ledger requires no approval. Run `approve` only when the project's merge mechanism needs an approval status (`approval_status` or `merge_mode: bot` in `project.json`); it accepts a T0 run with build, verification and packet current, and refuses until CI is green. Under `manual` or no merge mode, merging still needs the human's consent (SKILL.md rule 9); the same one click can give it when the question says so.
+- **T1:** one question may approve up to 5 packets, each listed with its patch id ([human-surfaces.md](human-surfaces.md)). Each PR still gets its own `approve --pr N --expect-patch <listed id>`, which refuses a patch other than the one listed.
+- **T2:** one question per PR, never batched. Only a delegated approval under a logged grant replaces it ([delegation.md](delegation.md)).
+
+### T1 site pattern (evidence-approved)
+
+A provider's own module (one per site, endpoint or integration) that follows an existing, conformance-tested pattern is T1 already: SKILL.md rule 5 approves T1 code on conformance + invariants + live proof, and T1 has no cold read and no must-read lines. No extra tier is needed. The approval reads the live-proof table and the usage-metering evidence (each call's billed quantity next to the quantity the external provider charged), not the diff. It holds only when:
+- the money, key and routing values each module uses are pinned in a shared T2 file that the conformance suite checks every module against, so a module cannot change them unseen;
+- the conformance suite and its fixtures are T2 and read, never T1 or skip-read: they are what vouches for the T1 files;
+- the path rules list only the modules as T1 and keep every shared file T2, including shared helpers inside a provider's own folder. First match wins, so the T2 rules come first:
+
+```json
+{"glob": "tests/conformance/**", "tier": "t2"},
+{"glob": "tests/fixtures/conformance/**", "tier": "t2"},
+{"glob": "src/providers/shared/**", "tier": "t2"},
+{"glob": "src/providers/*/sites/_*.py", "tier": "t2"},
+{"glob": "src/providers/*/sites/base.py", "tier": "t2"},
+{"glob": "src/providers/*/sites/common*", "tier": "t2"},
+{"glob": "src/providers/<name>/sites/special.py", "tier": "t2"},
+{"glob": "src/providers/*/sites/**", "tier": "t1"}
+```
+
+These go before any broader `tests/**` or `tests/fixtures/**` rule. `src/providers/shared/**` is the shared layer (pin table, billing, privacy, registry); `_*.py` covers `__init__.py`; the `<name>` rule pins a module that sets its own billing rule. A site PR that needs a shared-file change (a pin row, a registration) follows SKILL.md rule 3: the layer owner lands it as a separate T2 PR, and the site PR waits for it. The escalation list above still applies to every module.
 
 ## Split rules
 

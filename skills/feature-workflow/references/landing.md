@@ -26,7 +26,7 @@ Every key is optional. A missing file or key takes the default, and JSON `null` 
 Placeholders, each with a fixed character set. A value outside its set is refused before anything runs, but only when a template that will run uses it:
 - `{pr}`: digits;
 - `{sha}` (local HEAD) and `{patch_id}`: hex;
-- `{approver}`: letters, digits, space and `. _ - ( ) '`;
+- `{approver}`: ASCII letters, digits, space and `. _ - ( ) ' :`, starting with a letter, digit, `_` or `(`; `approve` checks it on every call (`delegated:<session>` only under `--grant`, [delegation.md](delegation.md));
 - `{head_ref}` (current branch): `A-Z a-z 0-9 . _ / -`;
 - `{date}`: UTC timestamp.
 
@@ -34,12 +34,15 @@ A template is split with `shlex` first and then filled per argument, so no value
 
 ## Commands
 
-- **`workflow_state.py approve --slug S --pr N --approver NAME [--evidence-url URL] [--dry-run]`**
+- **`workflow_state.py approve --slug S --pr N (--approver NAME | --grant ROW --grant-at T --grant-until T [--grant-merges]) [--expect-patch ID] [--evidence-url URL] [--dry-run]`**
+  - Works for every tier; a T0 run needs only build, verification and packet current.
+  - `--approver` is ASCII, and a name starting with `delegated` or holding `delegated:` is refused. `--expect-patch` refuses unless the current patch id starts with the id the human was shown.
+  - `--grant` records a delegated approval as `delegated:<session>`; it needs `--expect-patch`, refuses over 150 changed lines, and is checked against the grant's window and pinned repo-wide ([delegation.md](delegation.md)).
   - Refuses unless the run is open, the patch is not empty, every artifact before approval is current, no gate blocks approval, the worktree is clean, the patch leaves `.feature-workflow/` alone, and `pr_head` equals the local HEAD.
   - Runs `mark_ready`, checks `pr_head` again, and then takes the ledger lock. Under the lock it re-loads and re-evaluates the run, refusing if approval is no longer allowed on the same head and patch. Only then does it run `approval_status` and record `approval`, with the approver, patch id, PR, project config, `merge_mode`, `required_checks`, and each command's argv and output.
   - On a failure before `approval_status`, no approval status is left behind. If `approval_status` itself fails, nothing is recorded except an `approval_attempts` entry, which never counts as an approval.
 - **`workflow_state.py carry --slug S --pr N [--dry-run]`**, after a rebase (rule 7):
-  - Refuses unless the approval was recorded by `approve` for the same PR.
+  - Refuses unless the approval was recorded by `approve` for the same PR. A delegated approval also refuses once its grant window has closed (`re-approval needed: delegation window closed`).
   - Compares each file's hunks in the approved patch with the current patch, ignoring index lines and hunk line numbers. The approval carries only when every must-read file (t2, not `skip_read`) has byte-identical hunks and every changed file matches a `skip_read` rule. A t1 file without `skip_read` is neither, so it fails closed.
   - Build and verification must already be re-recorded on the new head, so carry never skips them.
   - It checks `pr_head`, re-evaluates under the lock, re-runs `approval_status` on the new head, and records a `carry` artifact with the same landing fields as `approve`; `status` lists every carry.
