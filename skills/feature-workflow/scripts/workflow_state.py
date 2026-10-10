@@ -701,9 +701,9 @@ def squash_candidate(repo: Path, state: dict[str, Any], remote: str) -> tuple[st
     return sha, ""
 
 
-def approved_patch(state: dict[str, Any]) -> str:
-    carry = live_carry(state)
-    record = carry or state["artifacts"].get("approval") or state["artifacts"]["packet"]
+def approved_patch(state: dict[str, Any], patch: str) -> str:
+    """The approved patch id that `patch` should match: a carry's when it carried to `patch`."""
+    record = live_carry(state, patch) or state["artifacts"].get("approval") or state["artifacts"]["packet"]
     return record["patch_id"]
 
 
@@ -717,9 +717,9 @@ def verify_merge(repo: Path, state: dict[str, Any], remote: str | None, report: 
     if not on_line or not is_ancestor(repo, report["head_sha"], merge_sha):
         raise WorkflowError(f"--remote-sha {merge_sha} is not a commit on {state['base_ref']}'s first-parent line "
                             "that contains HEAD")
-    approved = approved_patch(state)
     merged_patch = report["patch_id"] if merge_sha == report["head_sha"] else \
         patch_id(repo, f"{merge_sha}^1", merge_sha)
+    approved = approved_patch(state, merged_patch)
     if merged_patch != approved:
         raise WorkflowError(f"merge {merge_sha} brings patch {merged_patch}, not the approved patch {approved}")
     return merge_sha, merged_patch
@@ -775,12 +775,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     merge_patch, landing = None, "push"
     if squash:
         merge_patch, landing = (squash, patch_id(repo, f"{squash}^1", squash)), "squash"
-        if merge_patch[1] != approved_patch(state):
+        if merge_patch[1] != approved_patch(state, merge_patch[1]):
             raise WorkflowError(f"squash {squash} brings patch {merge_patch[1]}, not the approved patch "
-                                f"{approved_patch(state)}")
+                                f"{approved_patch(state, merge_patch[1])}")
         if run_git(repo, "rev-parse", "HEAD") not in first_parent_line(repo, state["base_ref"]):
             live = snapshot(repo, state["base_ref"], state["artifacts"]["build"]["base_sha"])["patch_id"]
-            if live != approved_patch(state):  # commits after approval must not ride a rebase-merge
+            if live != approved_patch(state, live):  # commits after approval must not ride a rebase-merge
                 raise WorkflowError(f"HEAD carries patch {live}, not the approved patch; re-run from build")
     elif artifact == "published" and report["merged"]:
         merge_patch, landing = verify_merge(repo, state, args.remote_sha, report), "merge"
@@ -818,7 +818,10 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 def store(state: dict[str, Any], path: Path, artifact: str, report: dict[str, Any], file_path: str | None,
           extra: dict[str, Any]) -> dict[str, Any]:
+    carry = live_carry(state, report.get("patch_id")) if artifact == "approval" else None
     state["revision"] += 1
+    if carry:  # re-approving the carried patch: cold-read and packet still reach it through the carry
+        carry["approval_revision"] = state["revision"]
     entry: dict[str, Any] = {
         "revision": state["revision"],
         "recorded_at": utc_now(),
@@ -851,6 +854,9 @@ def require_current(report: dict[str, Any], state: dict[str, Any], artifact: str
 
 
 def landing_values(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str) -> dict[str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/#-]*", args.pr) or not approver.strip() or approver[0] == "-":
+        raise WorkflowError("--pr must be a PR number or branch name, and the approver a name; neither may start "
+                            "with '-', since they become command arguments")
     return {"pr": args.pr, "sha": report["head_sha"], "patch_id": report["patch_id"], "approver": approver,
             "date": utc_now(), "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
 
@@ -866,10 +872,14 @@ def check_pr_head(repo: Path, config: dict[str, Any], values: dict[str, str]) ->
     return result
 
 
-def run_landing(repo: Path, args: argparse.Namespace, keys: tuple[str, ...], values: dict[str, str],
+def run_landing(repo: Path, args: argparse.Namespace, keys: tuple[str, ...], values: dict[str, str], base: str,
                 extra: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Check the PR head, then run the project's commands for `keys` in order; with --dry-run print them."""
     config = load_project(find_project(repo, args.project))
+    if config["path"] and repo in Path(config["path"]).parents \
+            and run_git(repo, "diff", "--name-only", base, values["sha"], "--", config["path"]):
+        raise WorkflowError(f"this patch changes {config['path']}, whose commands approve and carry run; land that "
+                            "change first, or pass --project with a config outside the branch")
     head = check_pr_head(repo, config, values)
     planned = [render(config[key], values) for key in keys if config[key]]
     landing = {"project_config": config["path"], "pr_head": head["argv"], "merge_mode": config["merge_mode"],
@@ -894,7 +904,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     require_current(report, state, "approval")
     values = landing_values(repo, args, report, args.approver)
     extra: dict[str, Any] = {"approver": args.approver, "evidence_url": args.evidence_url, "pr": args.pr}
-    done = run_landing(repo, args, ("approval_status", "mark_ready"), values, extra)
+    done = run_landing(repo, args, ("approval_status", "mark_ready"), values, report["base_sha"], extra)
     if done is None:
         return 0
     note = path.parent / f"approval.{state['revision'] + 1}.md"
@@ -949,6 +959,8 @@ def cmd_carry(args: argparse.Namespace) -> int:
     approval = state["artifacts"].get("approval")
     if not approval or approval.get("invalidated"):
         raise WorkflowError("no approval to carry; run approve")
+    if approval.get("pr") not in (None, args.pr):
+        raise WorkflowError(f"the approval is for PR {approval['pr']}, not {args.pr}")
     for sha in (approval["base_sha"], approval["head_sha"]):
         if not resolve_commit(repo, sha):
             raise WorkflowError(f"approved commit {sha} is not in this repository; re-approval needed")
@@ -967,7 +979,7 @@ def cmd_carry(args: argparse.Namespace) -> int:
     report = evaluate(trial, repo, current)
     require_current(report, trial, "published")  # build and verification must be re-recorded on the new head
     values = landing_values(repo, args, report, approval["approver"])
-    if run_landing(repo, args, ("approval_status",), values, entry) is None:
+    if run_landing(repo, args, ("approval_status",), values, report["base_sha"], entry) is None:
         return 0
     state["revision"] += 1
     state["artifacts"]["carry"] = entry
@@ -1110,7 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
                                 ("carry", cmd_carry, "after a rebase, carry the approval when only skip-read files "
                                  "changed, and re-set the approval status on the new head")):
         land = subparsers.add_parser(name, help=text)
-        add_common(land, rules=True)
+        add_common(land)  # no --rules: a re-pin would write state, even under --dry-run
         land.add_argument("--pr", required=True, help="PR number or branch, as the project's commands take it")
         land.add_argument("--project", help="project config (default: ancestor .feature-workflow/<origin-name>"
                           ".project.json, else <repo>/.feature-workflow/project.json)")

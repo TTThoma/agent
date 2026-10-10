@@ -790,6 +790,50 @@ class LandingTest(RepoCase):
         self.assertIn("patch identical, no files changed", result.stdout)
         self.assertEqual(self.calls()[-1][1], self.head())
 
+    def carry_fixture_change(self) -> str:
+        """Approve, then carry to a fixture-only change; returns the approved head."""
+        self.approved_run()
+        approved_head = self.head()
+        self.commit("tests/fixtures/rows.json", "[1, 2]\n", "fixture fix")
+        self.record("build")
+        self.record("verification")
+        self.publish_head()
+        self.assertEqual(self.land("carry").returncode, 0)
+        return approved_head
+
+    def test_reapprove_after_carry_stays_current(self) -> None:
+        self.carry_fixture_change()
+        self.assertEqual(self.land("approve", "--approver", "ann").returncode, 0)
+        report = self.status()
+        for name in ("cold-read", "packet", "approval"):
+            self.assertEqual(report["artifacts"][name]["status"], "current", name)
+
+    def test_merge_of_approved_patch_publishes_after_carry_is_undone(self) -> None:
+        approved_head = self.carry_fixture_change()
+        self.exec_cmd("git", "reset", "-q", "--hard", approved_head)
+        self.record("build")
+        self.record("verification")
+        self.exec_cmd("git", "switch", "-q", "origin/main")
+        self.exec_cmd("git", "merge", "-q", "--no-ff", "feature", "-m", "merge feature")
+        merge = self.head()
+        self.exec_cmd("git", "switch", "-q", "feature")
+        self.record("published", "--remote-sha", merge)
+        self.assertTrue(self.status()["complete"])
+
+    def test_landing_refuses_option_like_pr_and_branch_controlled_config(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        self.commit(".feature-workflow/project.json", json.dumps(self.project), "config in the branch")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        option = self.workflow("approve", "--pr=--undo", "--approver", "ann", check=False)
+        self.assertIn("--pr must be a PR number or branch name", option.stderr)
+        branch = self.workflow("approve", "--pr", "7", "--approver", "ann", "--dry-run", check=False)
+        self.assertIn("this patch changes", branch.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_purpose_is_stored_and_shown(self) -> None:
         self.init("t2", "--purpose", "land bundle A")
         self.assertEqual(self.status()["purpose"], "land bundle A")

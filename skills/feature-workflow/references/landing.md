@@ -4,7 +4,7 @@ The land stage runs from approval to merge: record the approval, wait for requir
 
 ## Project config: `.feature-workflow/project.json`
 
-Project-specific commands live with the project, not in the skill. The ledger looks for `--project <path>`, then the first ancestor `.feature-workflow/<origin-name>.project.json` outside the main checkout (next to `<origin-name>.tiers.json`), then the in-tree `<repo>/.feature-workflow/project.json`. The in-tree copy is controlled by the branch under review, and its commands run on approval, so it stays t2 must-read unless the tiers file says otherwise. `approve` and `carry` print the file they loaded.
+Project-specific commands live with the project, not in the skill. The ledger looks for `--project <path>`, then the first ancestor `.feature-workflow/<origin-name>.project.json` outside the main checkout (next to `<origin-name>.tiers.json`), then the in-tree `<repo>/.feature-workflow/project.json`. The in-tree copy is controlled by the branch under review, and its commands run on approval, so `approve` and `carry` refuse while the patch changes it: land that change first. They print the file they loaded. `--pr` and the approver become command arguments, so neither may start with `-`.
 
 Every key is optional. A missing file or key takes the default, and JSON `null` switches a command off.
 
