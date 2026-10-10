@@ -5,7 +5,7 @@ The tier decides which stages run and what the human reads. The run's tier is ne
 | Tier | Typical content | Human reads | Gate |
 |---|---|---|---|
 | **T0 mechanical** | docs, recorded fixtures, pure moves/renames, fan-out rows of an approved template | nothing; packet is FYI | verification green + classifier confirms T0 |
-| **T1 pattern** | new adapter/site/meter row following an existing, conformance-tested pattern; price rows that follow a recorded pricing rule | packet only, no code | conformance + invariants + live proof green, human approves packet |
+| **T1 pattern** | new adapter/site/meter row following an existing, conformance-tested pattern; price rows that follow a recorded pricing rule | packet only, no code (text/tests: the full diff, ≤40 lines) | code: conformance + invariants + live proof green; text/tests: tests green; human approves packet |
 | **T2 core** | shared layers, billing/metering semantics, keys/auth/secrets, routing/failover, migrations, global caps or request policies, anything that changes behaviour of every provider | packet + ≤400 must-read lines | cold-read done, must-read within budget, human approves patch |
 
 Generated mirrors of prices or permissions are T2: the row is the change. A lockfile-only change floors T2 with nothing to read, so its packet lists every version change instead.
@@ -16,7 +16,9 @@ Escalate to T2 regardless of paths when the change:
 - changes what is billed or how much (quantity, meter, unbilled conditions);
 - lets caller input reach a vendor request in a new way (overrides, allowlists);
 - stores or logs vendor responses, errors, or keys;
-- cannot be covered by the conformance suite.
+- cannot be covered by the conformance suite;
+- is text or tests only but over 40 changed lines;
+- removes or weakens a test assertion (deleted asserts, loosened tolerances, added skips): tests cannot vouch for their own weakening.
 
 ## tiers.json
 

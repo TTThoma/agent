@@ -2,8 +2,8 @@
   "_about": [
     "Read by feature-workflow v2 (workflow_state.py) and risk-tiers.md. First matching glob wins; only t2 files without skip_read count toward must_read_budget.",
     "Fail closed: any path not listed is t2, including this file, install.sh, agents/ and other skills.",
-    "The ledger script decides gates, so it stays t2 and is read. Skill text and its tests are t1: they are judged on evidence (tests, a classify run), not line reading.",
-    "In-tree rules for TTThoma/agent (maintainer decision D3, feature-workflow v2.1 brief). Agents need explicit permission to edit this file; the ledger pins its sha256 at run start and blocks packets when it changes."
+    "The ledger script decides gates, so it stays t2 and is read. Skill text and its tests are t1: approvable when the tests pass and the diff, at most 40 changed lines, is shown in full in the packet; larger diffs and diffs that weaken a test assertion are T2 (SKILL.md rule 5, references/risk-tiers.md).",
+    "In-tree rules for TTThoma/agent. Changes to this file are a T2 change (references/risk-tiers.md); the ledger pins its sha256 at run start and blocks packets when it changes."
   ],
   "default_tier": "t2",
   "must_read_budget": 400,
