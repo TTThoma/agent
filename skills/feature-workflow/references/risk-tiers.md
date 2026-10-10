@@ -48,6 +48,12 @@ Tiers are per file, so when a file mixes registration rows with policy, mark it 
 
 The first matching rule wins. The ledger's `classify` command prints per-file tiers, the floor and the must-read line count; `record --artifact packet` refuses when the tier is below the floor or a T2 run is over budget. A maintainer-approved override, `--marked-lines N --budget-override-reason`, lets one packet revision count the lines it marks as must-read (N ≤ budget); it is logged in `budget_overrides` and never touches the floor. Changing the in-tree fallback is itself a T2 change: it moves the trust boundary.
 
+The count leaves out lines nobody needs to re-read, and reports them as `must-read: N counted, M excluded (moved X, whitespace Y)`:
+- **moved:** lines git marks as moved (`--color-moved=zebra --color-moved-ws=allow-indentation-change`, blocks of ≥20 alphanumerics) between must-read files only. One line per moved block on the added side still counts, because where a block lands can change behaviour. A block moved out of a skip-read or t1 file counts in full, as does a file renamed into a must-read path.
+- **whitespace:** a change block whose lines are equal once trailing whitespace and blank lines are dropped. Outside moved blocks, indentation and spacing inside a line still count: they change meaning in Python, YAML and string literals.
+- **format** (optional): with `"formatter": {"command": "ruff format --no-cache --stdin-filename {path} -", "globs": ["**/*.py"]}` in the rules, a matching file counts the diff between the formatted old and new blobs when that is smaller. The command reads stdin, writes stdout and must not change semantics. Name a trusted binary by path, never `uv run`, `npx` or `poetry run`, which install from the branch's lockfile. It runs only from a rules file outside the worktree, so a branch cannot name its own command, and the rules pin covers it.
+A changed line is never excluded, and any doubt in parsing git's output leaves the raw count.
+
 ## Split rules
 
 When must-read lines exceed the budget, or a PR mixes tiers, cut it into a stack in this order:

@@ -60,8 +60,9 @@ PROJECT_DEFAULTS: dict[str, Any] = {
     "retrigger": None,
     "required_checks": [],
     "merge_mode": None,
+    "checks": "gh pr checks {pr} --json name,bucket",
 }
-TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger")
+TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger", "checks")
 MERGE_MODES = ("bot", "manual")
 PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
@@ -72,6 +73,18 @@ SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_R
 IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
 HUNK_HEADER_RE = re.compile(rb"^@@ [^\n]*", re.M)
+# Moved-line detection: pin every colour git uses, so each +/- line starts with one known code.
+MOVE_COLOURS = {"old": "red", "new": "green", "oldMoved": "magenta", "oldMovedAlternative": "blue",
+                "newMoved": "cyan", "newMovedAlternative": "yellow", "meta": "normal", "frag": "normal",
+                "func": "normal", "context": "normal", "commit": "normal", "whitespace": "normal"}
+MOVE_CONFIG = [arg for key, colour in MOVE_COLOURS.items() for arg in ("-c", f"color.diff.{key}={colour}")] \
+    + ["-c", "diff.suppressBlankEmpty=false"]
+MOVED_CODES = {b"35", b"34", b"36", b"33"}
+MOVE_FLAGS = ("--color=always", "--color-moved=zebra", "--color-moved-ws=allow-indentation-change",
+              "--ws-error-highlight=none")
+HUNK_RE = re.compile(rb"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", re.S)
+DIFF_LINE_RE = re.compile(rb"(?:\x1b\[([0-9;]+)m)?([ +\-])(.*?)(?:\x1b\[m)?", re.S)
+EXCLUSIONS = ("moved", "whitespace", "format")
 
 
 class WorkflowError(RuntimeError):
@@ -353,8 +366,16 @@ def load_rules(path: Path | None) -> tuple[dict[str, Any] | None, dict[str, str 
         if not isinstance(rule.get("glob"), str) or rule.get("tier") not in TIERS:
             raise WorkflowError(f"invalid rule in {path}: {rule}")
         rules.append((glob_regex(rule["glob"]), rule["tier"], bool(rule.get("skip_read", False))))
+    formatter = data.get("formatter")
+    if formatter is not None:
+        command, globs = (formatter.get("command"), formatter.get("globs")) if isinstance(formatter, dict) else (0, 0)
+        if not isinstance(command, str) or set(PLACEHOLDER_RE.findall(command)) != {"path"} \
+                or not isinstance(globs, list) or not globs or not all(isinstance(g, str) for g in globs):
+            raise WorkflowError(f"invalid rules file {path}: formatter needs a command with {{path}} and globs")
+        formatter = {"argv": command, "globs": [glob_regex(g) for g in globs]}
     pin = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
-    return {"path": str(path), "default_tier": default_tier, "budget": budget, "rules": rules}, pin
+    return {"path": str(path), "default_tier": default_tier, "budget": budget, "rules": rules,
+            "formatter": formatter}, pin
 
 
 def path_tier(rules: dict[str, Any] | None, path: str) -> tuple[str, bool]:
@@ -366,28 +387,161 @@ def path_tier(rules: dict[str, Any] | None, path: str) -> tuple[str, bool]:
     return rules["default_tier"], False
 
 
-def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | None) -> dict[str, Any]:
-    raw = git_bytes(repo, "diff", *DIFF_FLAGS, "--numstat", "-z", base_sha, head_sha)
+def numstat(repo: Path, base_sha: str, head_sha: str, specs: list[str] | None = None) -> list[tuple[str, ...]]:
+    """(added, deleted, path, old_path) per file pair, in git's order; added is "-" for a binary file."""
+    raw = git_bytes(repo, "diff", *DIFF_FLAGS, "--numstat", "-z", base_sha, head_sha, "--", *(specs or []))
     tokens = raw.decode("utf-8", errors="surrogateescape").split("\0")
-    files: list[dict[str, Any]] = []
-    floor: str | None = None
-    added_total = deleted_total = 0
-    index = 0
+    entries, index = [], 0
     while index < len(tokens):
         entry, index = tokens[index], index + 1
         if not entry:
             continue
         added, deleted, path = entry.split("\t", 2)
-        old_path = None
+        old_path = ""
         if not path:  # rename: "added\tdeleted\t\0old\0new"
             old_path, path, index = tokens[index], tokens[index + 1], index + 2
+        entries.append((added, deleted, path, old_path))
+    return entries
+
+
+def moved_sections(repo: Path, base_sha: str, head_sha: str, specs: list[str]) -> list[list[list[tuple]]]:
+    """Per file pair: its change blocks (runs of +/- lines between context), each line (sign, moved, code,
+    content). Git marks a line moved when an equal block (>= 20 alphanumerics, indentation aside) is removed
+    in one place and added in another within these files."""
+    out = git_bytes(repo, "-c", "core.quotePath=false", *MOVE_CONFIG, "diff", *DIFF_FLAGS, *MOVE_FLAGS,
+                    base_sha, head_sha, "--", *specs)
+    sections: list[list[list[tuple]]] = []
+    old_left = new_left = 0
+    for raw in out.split(b"\n"):
+        if old_left > 0 or new_left > 0:
+            match = DIFF_LINE_RE.fullmatch(raw)
+            if not match:
+                if raw.lstrip(b"\x1b[m").startswith(b"\\"):  # "\ No newline at end of file"
+                    continue
+                raise WorkflowError(f"unparsed diff line {raw[:60]!r}")
+            code, sign, content = match.groups()
+            if sign == b" ":
+                old_left, new_left = old_left - 1, new_left - 1
+                sections[-1].append([])
+                continue
+            old_left, new_left = (old_left - 1, new_left) if sign == b"-" else (old_left, new_left - 1)
+            sections[-1][-1].append((sign, code in MOVED_CODES, code, content))
+        elif raw.startswith(b"diff --git "):
+            sections.append([[]])
+        elif raw.startswith(b"@@") and sections:
+            hunk = HUNK_RE.fullmatch(raw)
+            if not hunk:
+                raise WorkflowError(f"unparsed hunk header {raw[:60]!r}")
+            old_left, new_left = (int(value) if value is not None else 1 for value in hunk.groups())
+            sections[-1].append([])
+    return [[block for block in section if block] for section in sections]
+
+
+def line_exclusions(blocks: list[list[tuple]]) -> dict[str, int]:
+    """Moved lines, except one counted anchor per moved block on the added side (where it lands is news);
+    and whitespace: a change block whose unmoved lines are equal once trailing whitespace and blank lines go.
+    Outside moved blocks, indentation and spacing inside a line count: they change meaning in Python and YAML."""
+    found = {"moved_added": 0, "moved_deleted": 0, "ws_added": 0, "ws_deleted": 0}
+    for block in blocks:
+        previous = None
+        for sign, moved, code, _ in block:
+            if moved:
+                key = "moved_added" if sign == b"+" else "moved_deleted"
+                found[key] += 0 if sign == b"+" and previous != (sign, code) else 1
+            previous = (sign, code) if moved else None
+        rest = [(sign, content) for sign, moved, _, content in block if not moved]
+        kept = {side: [text.rstrip() for sign, text in rest if sign == side and text.strip()] for side in (b"-", b"+")}
+        if rest and kept[b"-"] == kept[b"+"]:
+            found["ws_deleted"] += sum(1 for sign, _ in rest if sign == b"-")
+            found["ws_added"] += sum(1 for sign, _ in rest if sign == b"+")
+    return found
+
+
+def formatter_allowed(repo: Path, rules: dict[str, Any] | None) -> bool:
+    """A formatter runs a command, so only a rules file outside every checkout of the repo (which a branch
+    controls) may name one; Git's own directory is not a checkout."""
+    if not rules or not rules.get("formatter"):
+        return False
+    path = Path(rules["path"]).resolve()
+    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    return common in path.parents or not ({repo, common.parent} & set(path.parents))
+
+
+def formatted_numstat(repo: Path, rules: dict[str, Any], base_sha: str, head_sha: str,
+                      item: dict[str, Any]) -> tuple[int, int] | None:
+    """Added and deleted lines between format(old blob) and format(new blob); None if it does not apply."""
+    formatter = rules["formatter"]
+    if not any(regex.fullmatch(item["path"]) for regex in formatter["globs"]):
+        return None
+    with tempfile.TemporaryDirectory(prefix="fw-format.") as scratch:
+        files = []
+        for sha, name in ((base_sha, item["old_path"] or item["path"]), (head_sha, item["path"])):
+            blob = git_bytes(repo, "cat-file", "blob", f"{sha}:{name}") if in_commit(repo, sha, name) else b""
+            try:
+                proc = subprocess.run(render(formatter["argv"], {"path": name}), cwd=repo, input=blob,
+                                      capture_output=True, check=False, timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if proc.returncode != 0:
+                return None
+            files.append(Path(scratch) / f"{len(files)}")
+            files[-1].write_bytes(proc.stdout)
+        proc = subprocess.run(["git", "diff", "--no-index", "--text", "--numstat", *map(str, files)], cwd=scratch,
+                              capture_output=True, check=False)
+        if proc.returncode not in (0, 1):
+            return None
+        fields = proc.stdout.split()
+        return (int(fields[0]), int(fields[1])) if fields else (0, 0)
+
+
+def exclude(repo: Path, base_sha: str, head_sha: str, files: list[dict[str, Any]],
+            rules: dict[str, Any] | None) -> str | None:
+    """Lower each diff-counted file's must-read by moved, whitespace-only and (with a trusted formatter) format-only
+    lines; any parse doubt leaves the raw count. Returns a note when exclusion was skipped."""
+    plain = [item for item in files if item["must_read"] and not item["whole_file"]]
+    if not plain:
+        return None
+    specs = [f":(literal){name}" for item in plain for name in (item["old_path"], item["path"]) if name]
+    try:
+        entries = numstat(repo, base_sha, head_sha, specs)
+        sections = moved_sections(repo, base_sha, head_sha, specs)
+    except WorkflowError as exc:
+        return f"no exclusions: {exc}"
+    if len(entries) != len(sections):
+        return "no exclusions: diff sections do not line up with numstat"
+    by_path = {item["path"]: item for item in plain}
+    formatter = formatter_allowed(repo, rules)
+    for (added, deleted, path, old_path), blocks in zip(entries, sections):
+        item = by_path.get(path)
+        lines = [line for block in blocks for line in block]
+        if item is None or (old_path or None) != item["old_path"] or added == "-" \
+                or (int(added), int(deleted)) != (sum(l[0] == b"+" for l in lines), sum(l[0] == b"-" for l in lines)):
+            continue  # unmatched or a different pairing: keep the raw count
+        found = line_exclusions(blocks)
+        read_added = item["added"] - found["moved_added"] - found["ws_added"]
+        read_deleted = item["deleted"] - found["moved_deleted"] - found["ws_deleted"]
+        excluded = {"moved": found["moved_added"] + found["moved_deleted"],
+                    "whitespace": found["ws_added"] + found["ws_deleted"], "format": 0}
+        shaped = formatted_numstat(repo, rules or {}, base_sha, head_sha, item) if formatter else None
+        if shaped and sum(shaped) < read_added + read_deleted:
+            excluded["format"] = read_added + read_deleted - sum(shaped)
+            read_added, read_deleted = shaped
+        item.update({"must_read": read_added + read_deleted, "read_added": read_added,
+                     "read_deleted": read_deleted, "excluded": excluded})
+    return None
+
+
+def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | None) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    floor: str | None = None
+    for added, deleted, path, old_path in numstat(repo, base_sha, head_sha):
         binary = added == "-"
-        item = {"path": path, "old_path": old_path,
+        item = {"path": path, "old_path": old_path or None,
                 "added": 0 if binary else int(added), "deleted": 0 if binary else int(deleted)}
         # A rename is judged by both paths: the higher tier, and skipped only if both paths skip.
         tier, skip = path_tier(rules, path)
         old_counts = False
-        if old_path is not None:
+        if old_path:
             old_tier, old_skip = path_tier(rules, old_path)
             old_counts = old_tier == "t2" and not old_skip
             if TIERS.index(old_tier) > TIERS.index(tier):
@@ -397,21 +551,27 @@ def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | N
             floor = tier
         counts = tier == "t2" and not skip
         read_added, read_deleted = (item["added"], item["deleted"]) if counts else (0, 0)
+        whole = counts and (binary or (bool(old_path) and not old_counts))
         if counts and binary:  # unreadable as a diff: the whole old and new content is must-read
             read_added = blob_lines(repo, head_sha, path)
             read_deleted = blob_lines(repo, base_sha, old_path or path)
-        elif counts and old_path is not None and not old_counts:  # moved into must-read: read all of it
+        elif whole:  # moved into must-read: read all of it, unchanged or not
             read_added = blob_lines(repo, head_sha, path)
-        added_total += read_added
-        deleted_total += read_deleted
-        files.append({**item, "binary": binary, "tier": tier, "skip_read": skip,
-                      "must_read": read_added + read_deleted})
+        files.append({**item, "binary": binary, "tier": tier, "skip_read": skip, "whole_file": whole,
+                      "must_read": read_added + read_deleted, "read_added": read_added, "read_deleted": read_deleted,
+                      "excluded": dict.fromkeys(EXCLUSIONS, 0)})
+    note = exclude(repo, base_sha, head_sha, files, rules)
+    excluded = {key: sum(item["excluded"][key] for item in files) for key in EXCLUSIONS}
+    added_total = sum(item.pop("read_added") for item in files)
+    deleted_total = sum(item.pop("read_deleted") for item in files)
     return {
         "files": files,
         "path_floor": floor,
         "must_read_lines": added_total + deleted_total,
         "must_read_added": added_total,
         "must_read_deleted": deleted_total,
+        "must_read_excluded": excluded,
+        "must_read_note": note,
         "must_read_budget": rules["budget"] if rules else None,
         "rules_path": rules["path"] if rules else None,
     }
@@ -596,7 +756,8 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         hard[name] = bool(reasons)
         status = "missing" if missing else ("stale" if reasons or moved else "current")
         statuses[name] = {"status": status, "reasons": sorted(reasons | moved), "notes": sorted(notes),
-                          "required": name in required}
+                          "required": name in required, "recorded_at": record.get("recorded_at"),
+                          "recorded_by": record.get("recorded_by") or record.get("approver")}
 
     next_artifact = next((name for name in ARTIFACT_ORDER
                           if name in required and statuses[name]["status"] != "current"), None)
@@ -612,6 +773,8 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         "must_read_lines": classified["must_read_lines"],
         "must_read_added": classified["must_read_added"],
         "must_read_deleted": classified["must_read_deleted"],
+        "must_read_excluded": classified["must_read_excluded"],
+        "must_read_note": classified["must_read_note"],
         "must_read_budget": classified["must_read_budget"],
         "rules_path": classified["rules_path"],
         "rules_sha256": classified["rules_sha256"],
@@ -850,7 +1013,10 @@ def cmd_record(args: argparse.Namespace) -> int:
             os.replace(temporary, resolved)
         resolved_path = str(resolved)
 
-    extra: dict[str, Any] = {"source_path": source} if artifact == "brief" else {}
+    extra: dict[str, Any] = {"source_path": source, "recorded_by": args.recorded_by} if artifact == "brief" \
+        else {"recorded_by": args.recorded_by}
+    if source:
+        warn_shared_brief(repo, path, source)
     if artifact == "approval":
         extra.update({"approver": args.approver, "evidence_url": args.evidence_url})
     if override:
@@ -863,6 +1029,22 @@ def cmd_record(args: argparse.Namespace) -> int:
             extra.update({"remote_sha": merge_patch[0], "merge_patch_id": merge_patch[1]})
     emit(store(state, path, artifact, report, resolved_path, extra))
     return 0
+
+
+def warn_shared_brief(repo: Path, path: Path, source: str) -> None:
+    """Each run snapshots its brief; several open runs pointed at one mutable file is still a smell."""
+    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    found = {*common.glob("feature-workflow/*/state.json"), *common.glob("worktrees/*/feature-workflow/*/state.json"),
+             *path.parent.parent.glob("*/state.json")} - {path}
+    for other in sorted(found):
+        try:
+            artifacts = json.loads(other.read_text(encoding="utf-8")).get("artifacts", {})
+        except (OSError, ValueError):
+            continue
+        if (artifacts.get("brief") or {}).get("source_path") == source and "published" not in artifacts:
+            print(f"warning: open run {other.parent.name} also records its brief from {source}; give each run its "
+                  "own brief file (each run keeps a snapshot, so later edits there do not reach this run)",
+                  file=sys.stderr)
 
 
 def store(state: dict[str, Any], path: Path, artifact: str, report: dict[str, Any], file_path: str | None,
@@ -1071,6 +1253,102 @@ def cmd_carry(args: argparse.Namespace) -> int:
     return 0
 
 
+PACKET_TITLE_RE = re.compile(r"## Review packet: (T[0-2]) · patch ([0-9a-f]{7,40}|empty) · head ([0-9a-f]{7,40})",
+                             re.I)
+PACKET_READ_RE = re.compile(r"\*\*Read these lines\*\* \((?:(\d[\d,]*) marked of )?(\d[\d,]*)\)")
+CHECK_BAD = {"fail": "failing", "cancel": "cancelled", "pending": "pending"}
+
+
+def packet_problems(text: str, state: dict[str, Any], report: dict[str, Any]) -> list[str]:
+    """Compare the packet's title line and read marker (human-surfaces.md) with the ledger and the worktree."""
+    problems = []
+    title = PACKET_TITLE_RE.fullmatch(text.splitlines()[0].strip() if text.strip() else "")
+    if not title:
+        problems.append("first line is not '## Review packet: <T0|T1|T2> · patch <id> · head <sha>'")
+    else:
+        tier, patch, head = title.group(1).lower(), title.group(2).lower(), title.group(3).lower()
+        if tier != state["tier"]:
+            problems.append(f"packet tier {tier.upper()} is not the run tier {state['tier'].upper()}")
+        if not report["head_sha"].startswith(head):
+            problems.append(f"packet head {head} is not the worktree HEAD {report['head_sha'][:12]}")
+        if not report["patch_id"].startswith(patch):
+            problems.append(f"packet patch {patch} is not the current patch-id {report['patch_id'][:12]}")
+    statuses, required = report["artifacts"], REQUIRED[state["tier"]]
+    for name in DEPENDENCIES["packet"]:
+        status = statuses[name]["status"]
+        if (name in required or status != "absent") and status != "current":
+            problems.append(f"{name} is {status}: {'; '.join(statuses[name]['reasons']) or 'not recorded'}")
+    read = PACKET_READ_RE.search(text)
+    budget, counted = report["must_read_budget"], report["must_read_lines"]
+    if read:
+        marked, stated = (int(value.replace(",", "")) if value else None for value in read.groups())
+        if stated != counted:
+            problems.append(f"packet must-read {stated} is not the counted {counted}")
+        if marked is not None and budget is not None and marked > budget:
+            problems.append(f"packet marks {marked} lines, over the budget {budget}")
+    elif state["tier"] == "t2":
+        problems.append("no '**Read these lines** (N)' marker (T2)")
+    split = not read or read.group(1) is None
+    problems += [f"{gate['gate']}: {gate['detail']}" for gate in report["gates"]
+                 if "packet" in gate["blocks"] and (split or gate["gate"] != SPLIT_GATE)]
+    if not report["worktree_clean"]:
+        problems.append("worktree has uncommitted changes")
+    return problems
+
+
+def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str]) -> list[str]:
+    """Required checks (all checks when none are named) must have passed; nothing pending or failing."""
+    if not config["checks"]:
+        return ["project config switches the checks command off"]
+    argv = render(config["checks"], values)
+    try:  # `gh pr checks` exits non-zero while checks are pending or failing; its JSON still says which
+        proc = subprocess.run(argv, cwd=repo, capture_output=True, text=True, check=False, timeout=120)
+        rows = json.loads(proc.stdout)
+        buckets = [(str(row["name"]), str(row["bucket"]).lower()) for row in rows]
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, KeyError) as exc:
+        return [f"cannot read checks from {shlex.join(argv)}: {exc}"]
+    required = config["required_checks"]
+    problems = [f"required check {name} has not reported" for name in required
+                if name not in {row for row, _ in buckets}]
+    problems += [f"check {name} is {CHECK_BAD[bucket]}" for name, bucket in buckets
+                 if bucket in CHECK_BAD and (not required or name in required)]
+    return problems
+
+
+def cmd_packet_check(args: argparse.Namespace) -> int:
+    """Before posting a packet: its head, patch-id and must-read count must match the ledger and the worktree;
+    with --pr, the PR head too, and no required check may be pending or failing. Never posts anything."""
+    repo, _, state = open_run(args)
+    report = evaluate(state, repo)
+    try:
+        text = Path(args.packet).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkflowError(f"cannot read packet {args.packet}: {exc}") from exc
+    problems = packet_problems(text, state, report)
+    if args.pr:  # read-only commands; nothing is recorded, so no ledger lock
+        config = project_config(repo, args.project, report["base_sha"])
+        values = {"pr": args.pr, "sha": report["head_sha"], "patch_id": report["patch_id"],
+                  "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
+        used = {name for key in ("pr_head", "checks") if config[key] for name in PLACEHOLDER_RE.findall(config[key])}
+        bad = [f"{{{key}}}={values[key]!r}" for key in sorted(used & values.keys())
+               if not re.fullmatch(VALUE_RES[key], values[key])]
+        if bad or used - values.keys():
+            raise WorkflowError(f"refusing to run pr_head or checks: out-of-set values {', '.join(bad) or 'none'}; "
+                                f"unavailable placeholders {', '.join(sorted(used - values.keys())) or 'none'}")
+        try:
+            if not config["pr_head"]:
+                raise WorkflowError("project config switches pr_head off; packet-check --pr needs the PR head")
+            check_pr_head(repo, render(config["pr_head"], values), values["sha"])
+        except WorkflowError as exc:
+            problems.append(str(exc))
+        problems += check_problems(repo, config, values)
+    if problems:
+        raise WorkflowError("packet-check refused, do not post:\n- " + "\n- ".join(problems))
+    print(f"packet-check ok: head {report['head_sha'][:12]}, patch {report['patch_id'][:12]}, must-read "
+          f"{report['must_read_lines']}" + (f", PR {args.pr} head and checks" if args.pr else ", PR not checked"))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     repo, _, state = open_run(args)
     report = evaluate(state, repo)
@@ -1086,17 +1364,21 @@ def cmd_status(args: argparse.Namespace) -> int:
               + ("; squash-merged, judged at the build snapshot" if report["squashed"] else ""))
         print(f"worktree: {'clean' if report['worktree_clean'] else 'dirty'}")
         print(f"rules: {report['rules_path'] or 'none'} (sha256 {report['rules_sha256'] or '-'})")
-        budget = report["must_read_budget"]
-        print(f"path floor: {report['path_floor'] or 'n/a'}; must-read lines: {report['must_read_lines']}"
-              + (f"/{budget}" if budget is not None else "")
-              + f" (+{report['must_read_added']}/-{report['must_read_deleted']})")
+        budget, excluded = report["must_read_budget"], report["must_read_excluded"]
+        print(f"path floor: {report['path_floor'] or 'n/a'}; budget: {budget if budget is not None else 'none'}")
+        print(f"must-read: {report['must_read_lines']} counted (+{report['must_read_added']}/"
+              f"-{report['must_read_deleted']}), {sum(excluded.values())} excluded (moved {excluded['moved']}, "
+              f"whitespace {excluded['whitespace']}" + (f", format {excluded['format']}" if excluded["format"] else "")
+              + ")" + (f"; {report['must_read_note']}" if report["must_read_note"] else ""))
         for gate in report["gates"]:
             print(f"GATE {gate['gate']}: {gate['detail']}")
         for name in ARTIFACT_ORDER:
             item = report["artifacts"][name]
             detail = "; ".join(item["reasons"] + item["notes"])
             label = "" if item["required"] else " [optional]"
-            print(f"{name}{label}: {item['status']}" + (f" ({detail})" if detail else ""))
+            who = f" [recorded by {item['recorded_by'] or 'unnamed'} at {item['recorded_at']}]" \
+                if item.get("recorded_at") else ""
+            print(f"{name}{label}: {item['status']}{who}" + (f" ({detail})" if detail else ""))
         for carry in report["carries"]:
             print(f"carry r{carry['revision']}: patch {carry['from_patch_id'][:12]} -> {carry['patch_id'][:12]} at "
                   f"{carry['head_sha'][:12]}; only {', '.join(carry['changed_files']) or 'no files'} changed")
@@ -1197,6 +1479,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "budget when --budget-override-reason is given")
     record.add_argument("--budget-override-reason", help="packet: accept a split-required packet whose "
                         "--marked-lines fit the budget")
+    record.add_argument("--recorded-by", help="who records it: the subagent or person that produced the artifact, "
+                        "at the moment it finished (e.g. implementer, cold-reader)")
     record.add_argument("--remote-sha", help="published: pushed SHA (must equal HEAD), or the merge commit "
                         "once the branch is merged (its first-parent diff must match the approved patch)")
     record.set_defaults(handler=locked(cmd_record))
@@ -1216,6 +1500,14 @@ def build_parser() -> argparse.ArgumentParser:
             land.add_argument("--approver", required=True, help="name of the human who approved")
             land.add_argument("--evidence-url", help="the approval message or comment URL")
         land.set_defaults(handler=handler)
+
+    packet_check = subparsers.add_parser("packet-check", help="before posting: match the packet's head, patch-id, "
+                                         "must-read count and (with --pr) PR head and checks to the ledger")
+    add_common(packet_check)
+    packet_check.add_argument("--packet", required=True, help="the packet file (grammar: human-surfaces.md)")
+    packet_check.add_argument("--pr", help="PR number (digits only): also check its head and required checks")
+    packet_check.add_argument("--project", help="project config, as for approve")
+    packet_check.set_defaults(handler=cmd_packet_check)
 
     status = subparsers.add_parser("status", help="evaluate missing and stale artifacts")
     add_common(status, rules=True)

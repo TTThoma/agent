@@ -267,7 +267,8 @@ class WorkflowStateTest(RepoCase):
         files = {item["path"]: item for item in result["files"]}
         self.assertEqual(set(files), {"core/a.py", "tests/fixtures/f.json", "docs/guide.md"})
         self.assertEqual(set(files["core/a.py"]),
-                         {"path", "old_path", "added", "deleted", "binary", "tier", "skip_read", "must_read"})
+                         {"path", "old_path", "added", "deleted", "binary", "tier", "skip_read", "must_read",
+                          "whole_file", "excluded"})
         self.assertEqual((files["core/a.py"]["tier"], files["core/a.py"]["added"]), ("t2", 3))
         self.assertEqual((files["tests/fixtures/f.json"]["tier"], files["tests/fixtures/f.json"]["skip_read"]),
                          ("t0", True))
@@ -625,6 +626,10 @@ if command == "pr-head":
     print(pathlib.Path(sys.argv[3]).read_text().strip())
 if command == "move":  # a push lands while approve runs
     pathlib.Path(sys.argv[3]).write_text(sys.argv[4])
+if command == "checks":  # like `gh pr checks`: JSON on stdout, exit 8 while any check is pending
+    text = pathlib.Path(sys.argv[3]).read_text()
+    print(text)
+    sys.exit(8 if "pending" in text else 0)
 sys.exit(3 if command == "fail" else 0)
 """
 
@@ -643,6 +648,7 @@ class LandingTest(RepoCase):
         super().setUp()
         self.log = self.state_dir / "calls.jsonl"
         self.pr_head_file = self.state_dir / "pr-head"
+        self.checks_file = self.state_dir / "checks.json"
         stub = self.state_dir / "stub.py"
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text(STUB, encoding="utf-8")
@@ -652,6 +658,7 @@ class LandingTest(RepoCase):
             "approval_status": f"{prefix} status {{sha}} {{patch_id}} {{approver}} {{date}}",
             "mark_ready": f"{prefix} ready {{pr}}",
             "merge_mode": "bot",
+            "checks": f"{prefix} checks {shlex.quote(str(self.checks_file))} {{pr}}",
         }
 
     def write_project(self, **overrides: object) -> Path:
@@ -980,6 +987,179 @@ class LandingTest(RepoCase):
         self.exec_cmd("git", "commit", "-q", "-m", "symlinked config")
         with self.assertRaisesRegex(module.WorkflowError, "not a regular file"):
             module.project_config(self.repo, None, self.head())
+
+    # packet-check: the four pilot errors (wrong head, stale patch-id, wrong count, CI pending) are refused.
+    def packet_run(self, checks: list[dict] | None = None) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\nlimit = 2\n", "core")
+        for name in ("build", "verification", "cold-read"):
+            self.record(name)
+        self.publish_head()
+        self.checks_file.write_text(json.dumps(checks or [{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
+
+    def packet(self, head: str | None = None, patch: str | None = None, count: object = None) -> Path:
+        report = self.status()
+        count = report["must_read_lines"] if count is None else count
+        path = self.state_dir / "packet-draft.md"
+        path.write_text(f"## Review packet: T2 · patch {patch or report['patch_id'][:12]} · head "
+                        f"{head or report['head_sha'][:12]}\n\n**What changed**\n- a limit\n\n"
+                        f"**Read these lines** ({count})\n| core/engine.py:1-2 | the limit | is 2 right? |\n",
+                        encoding="utf-8")
+        return path
+
+    def packet_check(self, packet: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.workflow("packet-check", "--packet", str(packet), "--project", str(self.write_project()),
+                             *extra, check=False)
+
+    def test_packet_check_passes_a_matching_packet(self) -> None:
+        self.packet_run()
+        self.project["required_checks"] = ["ci"]
+        result = self.packet_check(self.packet(), "--pr", "7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("packet-check ok", result.stdout)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks"])  # reads only, posts nothing
+        self.assertEqual(self.status()["artifacts"]["packet"]["status"], "absent")
+
+    def test_packet_check_refuses_wrong_head(self) -> None:
+        self.packet_run()
+        wrong = self.packet_check(self.packet(head="0123456789ab"))
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("packet head 0123456789ab is not the worktree HEAD", wrong.stderr)
+        self.pr_head_file.write_text("f" * 40 + "\n", encoding="utf-8")
+        unpushed = self.packet_check(self.packet(), "--pr", "7")
+        self.assertIn("is not the PR head", unpushed.stderr)
+
+    def test_packet_check_refuses_stale_patch_and_ledger(self) -> None:
+        self.packet_run()
+        stale = self.packet()
+        self.commit("core/engine.py", "route = 1\nlimit = 3\n", "review fix")
+        result = self.packet_check(stale)
+        self.assertIn("is not the current patch-id", result.stderr)
+        self.assertIn("verification is stale", result.stderr)
+        for name in ("build", "verification", "cold-read"):
+            self.record(name)
+        self.assertIn("is not the current patch-id", self.packet_check(stale).stderr)
+        self.assertEqual(self.packet_check(self.packet()).returncode, 0)
+
+    def test_packet_check_refuses_wrong_or_blank_count(self) -> None:
+        self.packet_run()
+        self.assertIn("packet must-read 3 is not the counted 2", self.packet_check(self.packet(count=3)).stderr)
+        self.assertIn("no '**Read these lines** (N)' marker", self.packet_check(self.packet(count="")).stderr)
+        self.assertEqual(self.packet_check(self.packet(count="0 marked of 2")).returncode, 0)
+
+    def test_packet_check_refuses_pending_or_failing_checks(self) -> None:
+        self.packet_run([{"name": "ci", "bucket": "pending"}, {"name": "lint", "bucket": "pass"}])
+        self.assertIn("check ci is pending", self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "fail"}]), encoding="utf-8")
+        self.assertIn("check lint is failing", self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.project["required_checks"] = ["ci"]  # only named checks gate; ci has not reported yet
+        result = self.packet_check(self.packet(), "--pr", "7")
+        self.assertIn("required check ci has not reported", result.stderr)
+        self.assertNotIn("lint", result.stderr)
+
+    def test_packet_check_refuses_before_cold_read(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification"):
+            self.record(name)
+        self.assertIn("cold-read is absent", self.packet_check(self.packet()).stderr)
+
+
+BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
+
+
+class MustReadTest(RepoCase):
+    """Moved and whitespace-only lines are excluded from must-read; changed lines never are."""
+
+    def classify(self) -> dict:
+        return json.loads(self.workflow("classify").stdout)
+
+    def test_block_moved_between_must_read_files_is_excluded(self) -> None:
+        self.commit_base_rules()
+        self.commit("core/fetch.py", "import os\n\n\n" + BLOCK, "base")
+        self.commit("core/common.py", "import sys\n", "base")
+        self.advance_base()
+        self.init("t2")
+        self.commit("core/fetch.py", "import os\n", "move out")
+        self.commit("core/common.py", "import sys\n\n\n" + BLOCK + "def added():\n    return 1\n", "move in")
+        result = self.classify()
+        raw = sum(item["added"] + item["deleted"] for item in result["files"])
+        self.assertEqual(raw, 38)
+        self.assertEqual(result["must_read_excluded"], {"moved": 35, "whitespace": 0, "format": 0})
+        self.assertEqual(result["must_read_lines"], 3)  # the two new lines and one anchor where the block landed
+
+    def test_line_edited_inside_a_moved_block_still_counts(self) -> None:
+        self.commit_base_rules()
+        self.commit("core/fetch.py", BLOCK, "base")
+        self.advance_base()
+        self.init("t2")
+        self.commit("core/fetch.py", "", "move out")
+        self.commit("core/common.py", BLOCK.replace("+ 2\n", "+ 20\n"), "move in, edited")
+        module = load_module()
+        base = self.exec_cmd("git", "rev-parse", "origin/main").stdout.strip()
+        lines = [line for section in module.moved_sections(self.repo, base, self.head(), [])
+                 for block in section for line in block]
+        edited = [line for line in lines if b"compute_total(value) + 2" in line[3]]
+        self.assertEqual(sorted((sign, moved) for sign, moved, _, _ in edited), [(b"+", False), (b"-", False)])
+        self.assertGreaterEqual(self.classify()["must_read_lines"], 2)
+
+    def test_block_moved_from_a_skip_read_file_counts_in_full(self) -> None:
+        self.commit_base_rules()
+        self.commit("tests/fixtures/helpers.py", BLOCK, "fixture")
+        self.advance_base()
+        self.init("t2")
+        self.exec_cmd("git", "rm", "-q", "tests/fixtures/helpers.py")
+        self.commit("core/helpers.py", BLOCK, "promote by copy")
+        result = self.classify()
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (16, 0))
+
+    def test_whitespace_only_blocks_are_excluded_but_indentation_counts(self) -> None:
+        self.commit_base_rules()
+        self.commit("core/w.py", "a = 1\nb = 2\nif ready:\n    c = 3\nd = 'x y'\n", "base")
+        self.advance_base()
+        self.init("t2")
+        self.commit("core/w.py", "a = 1   \n\nb = 2\nif ready:\nc = 3\nd = 'x  y'\n", "whitespace")
+        result = self.classify()
+        self.assertEqual(result["must_read_excluded"]["whitespace"], 3)  # trailing space and a blank line
+        self.assertEqual(result["must_read_lines"], 4)  # the dedent and the string literal are changes
+
+    def test_formatter_from_out_of_tree_rules_only(self) -> None:
+        strip = shlex.quote("import sys; sys.stdout.write(sys.stdin.read().replace(chr(32), str()))")
+        formatter = {"command": f"{shlex.quote(sys.executable)} -c {strip} {{path}}", "globs": ["core/**"]}
+        self.commit("core/f.py", "x = 1\ny = 2\n", "base")
+        self.advance_base()
+        self.init("t2", "--rules", str(self.write_rules(formatter=formatter)))
+        self.commit("core/f.py", "x=1\ny =  2\nz = 3\n", "format and add")
+        self.workflow("record", "--artifact", "brief", "--path", str(self.write_artifact("brief")))
+        self.workflow("record", "--artifact", "build", "--recorded-by", "implementer")
+        result = self.classify()
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["format"]), (1, 4))
+        text = self.workflow("status").stdout
+        self.assertIn("must-read: 1 counted (+1/-0), 4 excluded (moved 0, whitespace 0, format 4)", text)
+        self.assertRegex(text, r"build: current \[recorded by implementer at 20")
+        self.assertEqual(self.status()["artifacts"]["build"]["recorded_by"], "implementer")
+        in_tree = RULES | {"formatter": formatter}
+        self.commit(".feature-workflow/tiers.json", json.dumps(in_tree), "in-tree rules")
+        module = load_module()
+        rules, _ = module.load_rules(self.repo / ".feature-workflow" / "tiers.json")
+        self.assertFalse(module.formatter_allowed(self.repo, rules))  # the branch controls it: never run
+        with self.assertRaises(module.WorkflowError):
+            module.load_rules(self.write_rules(formatter={"command": "fmt -", "globs": ["**"]}))
+
+    def test_shared_brief_warns_other_open_run(self) -> None:
+        shared = self.repo.parent / f"{self.repo.name}-brief.md"
+        shared.write_text("# shared brief\n", encoding="utf-8")
+        self.addCleanup(shared.unlink)
+        self.init("t2")
+        first = self.workflow("record", "--artifact", "brief", "--path", str(shared))
+        self.assertNotIn("warning", first.stderr)
+        other = ("--slug", "other-run", "--state-dir", str(self.repo / ".git" / "fw-other"))
+        self.exec_cmd(sys.executable, str(SCRIPT), "init", *other, "--source", "x", "--base-ref", "origin/main")
+        second = self.exec_cmd(sys.executable, str(SCRIPT), "record", *other, "--artifact", "brief", "--path",
+                               str(shared))
+        self.assertIn("warning: open run feature-workflow-test also records its brief", second.stderr)
 
 
 if __name__ == "__main__":

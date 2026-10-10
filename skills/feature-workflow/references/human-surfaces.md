@@ -57,7 +57,7 @@ They read where the PR is. Post the packet as a PR comment and give them a ≤5-
 
 **Decisions in this PR** (log ids + any new agent decisions, one line each)
 
-**Read these lines** (T2 only; total ≤400)
+**Read these lines** (N)    ← T2 only; N = counted must-read lines, ≤ budget
 | file:lines | why it matters | question to answer |
 
 **Found and fixed by adversarial review** (material only, one line each)
@@ -76,6 +76,14 @@ They read where the PR is. Post the packet as a PR comment and give them a ≤5-
 ```
 
 The reviewer-map skill output is the agent-internal input to "Read these lines". Do not paste the whole map.
+
+### Packet grammar and `packet-check`
+
+Two lines are machine-checked; the rest is free text.
+- Line 1, exactly: `## Review packet: <T0|T1|T2> · patch <patch-id> · head <sha>`, with the run's tier and at least 7 hex characters of `status`'s patch-id and HEAD.
+- T2 only, a marker `**Read these lines** (N)`: N is `status`'s counted must-read lines. Under a budget override it is `(M marked of N)`, with M ≤ budget.
+
+Before posting, run `workflow_state.py packet-check --slug S --packet FILE --pr N`. It refuses, listing every mismatch, when the head, patch-id, tier or count differs from the worktree and ledger, when verification or (T2) cold-read is not current, when the PR head is not the local HEAD, or when a check is pending or failing: each name in the project's `required_checks`, or every check when none are named, read through the `checks` template (`landing.md`). It never posts or records anything. Without `--pr` it skips the PR head and checks, so use it only for a draft. Evidence from a 2026 pilot: a packet posted before CI, a cap count that went 18→16→15 and a blank line count all reached the maintainer.
 
 ## Digest (orchestrator, once per attention burst)
 

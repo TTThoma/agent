@@ -2,7 +2,7 @@
 
 ## Default: one session plus subagents
 
-The run's session is the orchestrator. It spawns subagents for research, implementation (in a worktree), review and the cold read, and it keeps decisions and persistence to itself. Nothing is relayed, so nothing is lost in relay. Use this mode for every run unless the escalation test below passes.
+The run's session is the orchestrator. It spawns subagents for research, implementation (in a worktree), review and the cold read, and it keeps decisions to itself. Subagents record their own artifacts when they finish (`--recorded-by implementer` for build and verification, `--recorded-by cold-reader` for the cold read); the orchestrator records brief, packet and approval. Nothing is relayed, so nothing is lost in relay. Use this mode for every run unless the escalation test below passes.
 
 ## Session purpose
 
