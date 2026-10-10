@@ -641,6 +641,10 @@ if command == "pr-head":
     print(pathlib.Path(sys.argv[3]).read_text().strip())
 if command == "move":  # a push lands while approve runs
     pathlib.Path(sys.argv[3]).write_text(sys.argv[4])
+if command == "draft":  # like `gh pr view --json isDraft -q .isDraft`
+    print(pathlib.Path(sys.argv[3]).read_text().strip())
+if command == "undraft":  # like `gh pr ready`
+    pathlib.Path(sys.argv[3]).write_text("false")
 if command == "checks":  # like `gh pr checks`: JSON on stdout, exit 8 while any check is pending
     text = pathlib.Path(sys.argv[3]).read_text()
     print(text)
@@ -1313,6 +1317,104 @@ class LandingTest(RepoCase):
             self.record(name)
         self.assertIn("cold-read is absent", self.packet_check(self.packet()).stderr)
 
+
+    # ready_at_packet: a check that runs only once the PR is out of draft can be required (v2.2).
+    RELEASE = ["lint", "unit-tests", "telem/whole-release"]
+
+    def ready_at_packet_run(self) -> None:
+        self.packet_run([{"name": "lint", "bucket": "pass"}, {"name": "unit-tests", "bucket": "pass"}])
+        self.draft_file = self.state_dir / "draft"
+        self.draft_file.write_text("true", encoding="utf-8")
+        quoted = shlex.quote(str(self.draft_file))
+        self.project.update({"required_checks": self.RELEASE, "ready_at_packet": True,
+                             "pr_draft": self.project["mark_ready"].replace("ready {pr}", f"draft {quoted} {{pr}}"),
+                             "mark_ready": self.project["mark_ready"].replace("ready {pr}", f"undraft {quoted} {{pr}}")})
+
+    def record_packet(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.workflow("record", "--artifact", "packet", "--path", str(self.packet()), "--pr", "7",
+                             "--project", str(self.write_project()), *extra, check=False)
+
+    def test_ready_at_packet_marks_ready_at_record_and_approve_does_not(self) -> None:
+        self.ready_at_packet_run()
+        self.project["ready_at_packet"] = False  # without the key the draft-only check blocks the packet
+        self.assertIn("required check telem/whole-release has not reported", self.record_packet().stderr)
+        self.project["ready_at_packet"] = True
+        self.log.unlink(missing_ok=True)
+        recorded = self.record_packet()
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks", "draft", "undraft", "pr-head"])
+        self.assertEqual(self.draft_file.read_text(), "false")
+        packet = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["packet"]
+        self.assertEqual(packet["packet_check"]["unreported_required"], ["telem/whole-release"])
+        self.assertEqual((packet["ready_marked"]["pr"], packet["ready_marked"]["was_draft"]), ("7", True))
+        self.assertEqual([item["argv"][3] for item in packet["ready_marked"]["commands"]], ["draft", "undraft"])
+        dry = self.land("approve", "--approver", "ann", "--dry-run")
+        self.assertEqual(sorted(json.loads(dry.stdout)["would_run"]), ["approval_status", "pr_draft", "pr_head"])
+        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "pass"}]), encoding="utf-8")
+        self.assertIn("required check telem/whole-release has not reported",
+                      self.land("approve", "--approver", "ann").stderr)  # approve checks every required check
+        self.checks_file.write_text(json.dumps(  # the sim: unit-tests passes on the draft, then skips on ready
+            [{"name": "lint", "bucket": "pass"}, {"name": "unit-tests", "bucket": "pass"},
+             {"name": "unit-tests", "bucket": "skipping"}, {"name": "telem/whole-release", "bucket": "pass"}]),
+            encoding="utf-8")
+        self.log.unlink(missing_ok=True)
+        approved = self.land("approve", "--approver", "ann")
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "draft", "checks", "pr-head", "status"])
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertEqual([item["argv"][3] for item in approval["commands"]], ["draft", "status"])
+        self.assertTrue(approval["landing"]["ready_at_packet"])
+        self.assertIn("unit-tests: 1 passed, 1 skipped", approval["checks_note"])
+
+    def test_approve_refuses_a_draft_under_ready_at_packet(self) -> None:
+        self.ready_at_packet_run()
+        self.checks_file.write_text(json.dumps([{"name": name, "bucket": "pass"} for name in self.RELEASE]),
+                                    encoding="utf-8")
+        self.workflow("record", "--artifact", "packet", "--path", str(self.packet()))  # no --pr: never marked
+        self.log.unlink(missing_ok=True)
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("PR 7 is a draft; under ready_at_packet, record --artifact packet --pr 7", refused.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "draft"])  # no ready, no status
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "fail"}]), encoding="utf-8")
+        skipped = self.record_packet("--skip-packet-check", "lint flake, rerun queued")
+        self.assertIn("not marked ready: packet-check was skipped", skipped.stderr)
+        self.assertEqual(self.draft_file.read_text(), "true")
+        self.draft_file.write_text("maybe", encoding="utf-8")
+        self.assertIn("cannot read the draft state", self.land("approve", "--approver", "ann",
+                                                               "--allow-skipped-packet-check").stderr)
+        module = load_module()
+        for bad in ({"ready_at_packet": "yes"}, {"ready_at_packet": True, "mark_ready": None},
+                    {"ready_at_packet": True, "pr_draft": None}):
+            with self.assertRaises(module.WorkflowError, msg=bad):
+                module.load_project(self.write_project(**bad))
+
+    def test_a_check_listed_twice_passes_on_pass_and_skipped_only(self) -> None:
+        self.packet_run()
+        self.project["required_checks"] = ["unit-tests"]
+        for buckets, message in ((["pass", "skipping"], None), (["skipping", "pass", "skipping"], None),
+                                 (["pass", "fail"], "required check unit-tests is failing"),
+                                 (["skipping", "skipping"], "required check unit-tests is skipped"),
+                                 (["skipping"], "required check unit-tests is skipped"),
+                                 (["pass", "pending"], "required check unit-tests is pending"),
+                                 (["pass", "cancel"], "required check unit-tests is cancelled")):
+            self.checks_file.write_text(json.dumps([{"name": "unit-tests", "bucket": bucket} for bucket in buckets]),
+                                        encoding="utf-8")
+            result = self.packet_check(self.packet(), "--pr", "7")
+            if message is None:
+                self.assertEqual(result.returncode, 0, (buckets, result.stderr))
+                self.assertIn("unit-tests: 1 passed", result.stdout)
+            else:
+                self.assertIn(message, result.stderr, buckets)
+        self.project["required_checks"] = []  # unnamed checks: any failing entry still refuses
+        self.checks_file.write_text(json.dumps([{"name": "e2e", "bucket": "pass"}, {"name": "e2e", "bucket": "fail"}]),
+                                    encoding="utf-8")
+        self.assertIn("check e2e is failing", self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.project["required_checks"] = ["unit-tests"]  # a command that lists a sha: only the head's entries count
+        self.checks_file.write_text(json.dumps([{"name": "unit-tests", "bucket": "fail", "sha": "0" * 40},
+                                                {"name": "unit-tests", "bucket": "pass", "sha": self.head()}]),
+                                    encoding="utf-8")
+        self.assertEqual(self.packet_check(self.packet(), "--pr", "7").returncode, 0)
 
 BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
 BODY = "".join(f"    total = total + compute_value(item, {i})\n" for i in range(6))
