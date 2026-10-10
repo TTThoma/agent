@@ -714,7 +714,8 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         statuses[name] = {"status": status, "reasons": sorted(reasons | moved), "notes": sorted(notes),
                           "required": name in required, "recorded_at": record.get("recorded_at"),
                           "recorded_by": record.get("recorded_by") or record.get("approver"),
-                          "packet_check_skipped": (record.get("packet_check") or {}).get("skipped")}
+                          "packet_check_skipped": (record.get("packet_check") or {}).get("skipped"),
+                          "pr_checked": bool((record.get("packet_check") or {}).get("pr"))}
 
     next_artifact = next((name for name in ARTIFACT_ORDER
                           if name in required and statuses[name]["status"] != "current"), None)
@@ -1113,11 +1114,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
     refuse_closed(state)
     report = evaluate(state, repo)
     require_current(report, state, "approval")
+    skipped = (state["artifacts"]["packet"].get("packet_check") or {}).get("skipped")
+    if skipped and not args.allow_skipped_packet_check:
+        raise WorkflowError(f"the packet was recorded with --skip-packet-check ({skipped}); re-record it, or pass "
+                            "--allow-skipped-packet-check")
     plan = landing_plan(repo, args, report, args.approver, ("mark_ready", "approval_status"))
     if plan is None:
         return 0
     values, steps, landing = plan
     check_pr_head(repo, steps["pr_head"], values["sha"])
+    ci, ci_note = check_problems(repo, project_config(repo, args.project, report["base_sha"]), values)
+    if ci:
+        raise WorkflowError("cannot approve before CI is green: " + "; ".join(ci))
     done = [run_command(repo, steps["mark_ready"])] if "mark_ready" in steps else []
     check_pr_head(repo, steps["pr_head"], values["sha"], "it moved after mark_ready; no approval status set")
     with ledger_lock(path):
@@ -1139,7 +1147,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
         lines += [f"- `{shlex.join(item['argv'])}` exit 0 {item['stdout']}".rstrip() for item in done]
         note.write_text("\n".join(lines) + "\n", encoding="utf-8")
         extra = {"approver": args.approver, "evidence_url": args.evidence_url, "pr": args.pr, "landing": landing,
-                 "commands": done}
+                 "commands": done, "checks_note": ci_note or None,
+                 "allow_skipped_packet_check": bool(args.allow_skipped_packet_check)}
         emit(store(state, path, "approval", report, str(note), extra))
     return 0
 
@@ -1225,8 +1234,8 @@ def cmd_carry(args: argparse.Namespace) -> int:
     return 0
 
 
-PACKET_TITLE_RE = re.compile(r"## Review packet: (T[0-2]) · patch ([0-9a-f]{7,40}|empty) · head ([0-9a-f]{7,40})",
-                             re.I)
+PACKET_TITLE_RE = re.compile(r"## Review packet: (T[0-2]) · patch ([0-9a-f]{7,40}|empty) · head ([0-9a-f]{7,40})"
+                             r"(?:\s.*)?", re.I)
 PACKET_MARKER = "**Read these lines**"
 PACKET_READ_RE = re.compile(r"\*\*Read these lines\*\* \((?:(\d+) marked of )?(\d+)\)")
 CHECK_STATES = {"pass": "passed", "fail": "failing", "pending": "pending", "skipping": "skipped",
@@ -1256,7 +1265,12 @@ def packet_problems(text: str, state: dict[str, Any], report: dict[str, Any],
         status = statuses[name]["status"]
         if (name in required or status != "absent") and status != "current":
             problems.append(f"{name} is {status}: {'; '.join(statuses[name]['reasons']) or 'not recorded'}")
-    markers = [line for line in lines if line.startswith(PACKET_MARKER)]  # a quoted or indented one is not it
+    markers, fenced = [], False
+    for line in lines:  # a quoted, indented or fenced marker is not it
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and line.startswith(PACKET_MARKER):
+            markers.append(line)
     read = PACKET_READ_RE.match(markers[0]) if markers else None
     counted = report["must_read_lines"]
     if read:
@@ -1285,6 +1299,10 @@ def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str]) -
     (problems, note); `checks: null` in the project config means the project has no CI."""
     if not config["checks"]:
         return [], "no CI (project config sets checks to null)"
+    used = set(PLACEHOLDER_RE.findall(config["checks"]))
+    bad = sorted(key for key in used if key not in values or not re.fullmatch(VALUE_RES[key], values[key]))
+    if bad:
+        raise WorkflowError(f"refusing to run checks: placeholders {', '.join(bad)} are unavailable or out of set")
     argv = render(config["checks"], values)
     try:  # `gh pr checks` exits non-zero while checks are pending or failing; its JSON still says which
         proc = subprocess.run(argv, cwd=repo, capture_output=True, text=True, check=False, timeout=120)
@@ -1394,6 +1412,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 if item.get("recorded_at") else ""
             skipped = f" [packet-check skipped: {item['packet_check_skipped']}]" \
                 if item.get("packet_check_skipped") else ""
+            if name == "packet" and item.get("recorded_at") and not item.get("pr_checked"):
+                skipped += " [PR/CI not checked]"
             print(f"{name}{label}: {item['status']}{who}{skipped}" + (f" ({detail})" if detail else ""))
         for carry in report["carries"]:
             print(f"carry r{carry['revision']}: patch {carry['from_patch_id'][:12]} -> {carry['patch_id'][:12]} at "
@@ -1519,6 +1539,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "approve":
             land.add_argument("--approver", required=True, help="name of the human who approved")
             land.add_argument("--evidence-url", help="the approval message or comment URL")
+            land.add_argument("--allow-skipped-packet-check", action="store_true", help="approve a packet recorded "
+                              "with --skip-packet-check; recorded in the approval")
         land.set_defaults(handler=handler)
 
     packet_check = subparsers.add_parser("packet-check", help="before posting: match the packet's head, patch-id, "

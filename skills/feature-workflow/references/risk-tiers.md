@@ -48,7 +48,7 @@ Tiers are per file, so when a file mixes registration rows with policy, mark it 
 
 The first matching rule wins. The ledger's `classify` command prints per-file tiers, the floor and the must-read line count; `record --artifact packet` refuses when the tier is below the floor or a T2 run is over budget. A maintainer-approved override, `--marked-lines N --budget-override-reason`, lets one packet revision count the lines it marks as must-read (N ≤ budget); it is logged in `budget_overrides` and never touches the floor. Changing the in-tree fallback is itself a T2 change: it moves the trust boundary.
 
-Must-read may exclude only lines that cannot change behaviour. `status` reports `must-read: N counted, M excluded (moved M)`; the only exclusion is a block moved unchanged between files:
+Must-read may exclude only lines that cannot change behaviour, so every changed line counts, with one exception: an unchanged block of ≥5 lines moved from one must-read file to another counts one anchor line on each side instead of all its lines. `status` reports `must-read: N counted, M excluded (moved M)`. In detail:
 - a run of ≥5 consecutive lines that git marks as moved (`--color-moved=zebra --color-moved-ws=no`: blocks of ≥20 alphanumerics, with no whitespace allowance, so any re-indent is a change), removed from one must-read file and added, byte-identical, to a different must-read file;
 - each excluded block keeps one counted anchor line on both sides, so the reader sees where the code left and where it arrived;
 - a move within one file (a reorder, such as moving a check after the code it guards) counts in full, as do shorter moves, edited lines inside a moved block, and blocks moved out of or into a skip-read or lower-tier file;

@@ -666,6 +666,7 @@ class LandingTest(RepoCase):
         stub = self.state_dir / "stub.py"
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text(STUB, encoding="utf-8")
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
         prefix = f"{shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(self.log))}"
         self.project = {
             "pr_head": f"{prefix} pr-head {shlex.quote(str(self.pr_head_file))} {{pr}}",
@@ -712,8 +713,8 @@ class LandingTest(RepoCase):
         self.approved_run()
         report = self.status()
         self.assertEqual(report["artifacts"]["approval"]["status"], "current")
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
-        ready, status = self.calls()[1], self.calls()[3]
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks", "ready", "pr-head", "status"])
+        ready, status = self.calls()[2], self.calls()[4]
         self.assertEqual(status[:4], ["status", self.head(), report["patch_id"], "Ann Lee"])  # one argv element
         self.assertEqual(ready, ["ready", "7"])
         approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
@@ -807,7 +808,7 @@ class LandingTest(RepoCase):
         self.publish_head()
         self.assertIn("notes.txt changed and not skip-read", self.land("carry").stderr)
         self.assertEqual(self.status()["artifacts"]["approval"]["status"], "stale")
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks", "ready", "pr-head", "status"])
 
     def test_carry_after_identical_rebase_resets_status(self) -> None:
         self.approved_run()
@@ -1116,6 +1117,45 @@ class LandingTest(RepoCase):
         self.assertIn("[packet-check skipped: head typo", self.workflow("status").stdout)
         self.assertIn("apply only to the packet", self.record("approval", "--approver", "ann", "--pr", "7",
                                                               check=False).stderr)
+
+    def ready_run(self) -> None:
+        self.packet_run()
+        self.record("packet")
+
+    def test_approve_refuses_before_ci_is_green(self) -> None:
+        self.ready_run()
+        self.assertIn("[PR/CI not checked]", self.workflow("status").stdout)
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pending"}]), encoding="utf-8")
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("cannot approve before CI is green: check ci is pending", refused.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks"])  # nothing set, nothing ready
+        self.project["required_checks"] = ["deploy"]
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
+        self.assertIn("required check deploy has not reported", self.land("approve", "--approver", "ann").stderr)
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+        self.project["checks"] = None
+        self.assertEqual(self.land("approve", "--approver", "ann").returncode, 0)
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertIn("no CI", approval["checks_note"])
+
+    def test_approve_refuses_a_packet_that_skipped_packet_check(self) -> None:
+        self.packet_run()
+        wrong = self.packet(head="0123456789ab")
+        self.workflow("record", "--artifact", "packet", "--path", str(wrong), "--skip-packet-check", "typo")
+        self.assertIn("--allow-skipped-packet-check", self.land("approve", "--approver", "ann").stderr)
+        allowed = self.land("approve", "--approver", "ann", "--allow-skipped-packet-check")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertTrue(approval["allow_skipped_packet_check"])
+
+    def test_packet_title_suffix_and_fenced_markers(self) -> None:
+        self.packet_run()
+        text = f"{self.title()} (rev 2)\n```\n**Read these lines** (99)\n```\n**Read these lines** (2)\n"
+        result = self.packet_check(self.draft(text), "--pr", "7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.workflow("record", "--artifact", "packet", "--path", str(self.draft(text)), "--pr", "7", "--project",
+                      str(self.write_project()))
+        self.assertNotIn("[PR/CI not checked]", self.workflow("status").stdout)
 
     def test_packet_check_refuses_before_cold_read(self) -> None:
         self.init("t2", "--rules", str(self.write_rules()))
