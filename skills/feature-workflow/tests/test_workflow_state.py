@@ -919,6 +919,27 @@ class LandingTest(RepoCase):
             refused = self.land("approve", f"--approver={approver}")
             self.assertIn("out-of-set values: {approver}", refused.stderr, approver)
 
+    def test_t0_approves_with_build_verification_and_packet_only(self) -> None:
+        self.init("t0", "--rules", str(self.write_rules()))
+        self.commit("tests/fixtures/rows.json", "[1]\n", "fixture")
+        for name in ("build", "verification", "packet"):
+            self.record(name)
+        self.publish_head()
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pending"}]), encoding="utf-8")
+        self.assertEqual(self.land("approve", "--approver", "Ann Lee").returncode, 1)  # T0 still waits for CI
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
+        result = self.land("approve", "--approver", "Ann Lee")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checks", [call[0] for call in self.calls()])
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "current")
+
+    def test_delegated_approver_may_contain_a_colon(self) -> None:
+        self.ready_for_approval()
+        self.assertEqual(self.land("approve", "--approver", "delegated:night-orchestrator").returncode, 0)
+        self.assertEqual(self.calls()[-1][3], "delegated:night-orchestrator")
+        refused = self.land("approve", "--approver=:x", "--dry-run")
+        self.assertIn("out-of-set values: {approver}", refused.stderr)
+
     def test_empty_patch_has_nothing_to_approve(self) -> None:
         self.init("t2", "--rules", str(self.write_rules()))
         self.record("brief")

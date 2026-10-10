@@ -9,7 +9,7 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 | `verification` | all | Prove health on this exact head. | `verification.md`: commands, exit codes, counts, conformance table, invariant results, live-proof table, skipped checks with reasons. | Required checks pass; `classify` floor ≤ tier; must-read within budget for T2. |
 | `cold-read` | T2 | Independent reconstruction, then intent comparison. | `cold-read.md`: reconstruction, then a separate comparison section written after intent is revealed. | Material discrepancies fixed or listed for the human as accepted risks. |
 | `packet` | all | Minimize human review cost. | `packet.md`, posted as a PR comment. | Within caps; every claim links to evidence; deploy line present. |
-| `approval` | T1, T2 | Accountable human decision on the exact patch. | `approval.md` (approver, time, patch id, head, outcome, conditions) + external record URL. | Named human approved this patch id. |
+| `approval` | T1, T2; T0 only where the merge mechanism needs an approval status | Accountable human decision on the exact patch. | `approval.md` (approver, time, patch id, head, outcome, conditions) + external record URL. | Named human approved this patch id, or `delegated:<session>` inside an active delegation window (`delegation.md`). |
 | `published` | all | Ship exactly what was approved. | Merge commit and deploy status; ops prerequisites ticked. | Remote head's patch equals the approved patch; deploy gate satisfied. |
 
 ## Stage notes
@@ -45,7 +45,7 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 - Record the packet with `record --artifact packet --pr N`, which runs `packet-check`, and post only the file it accepted (grammar in `human-surfaces.md`).
 
 ### approval
-- Ask one question. Record the approval with `approve --pr N --approver NAME`, which checks the PR head, sets the project's approval status and marks the PR ready (`landing.md`).
+- Ask one question; T0 and T1 packets may share a batch question (`human-surfaces.md`). Record each approval with `approve --pr N --approver NAME`, which checks the PR head, sets the project's approval status and marks the PR ready (`landing.md`).
 - A requested change returns to `build`. The ledger invalidates packet and approval when the patch changes.
 
 ### published

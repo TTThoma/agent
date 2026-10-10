@@ -75,6 +75,27 @@ They read where the PR is. Post the packet as a PR comment and give them a ≤5-
 **Approve?** One question. Options: approve this patch / request change (say what) / split.
 ```
 
+A T0 packet is 3 lines, the title line first (packet-check enforces it), with no question unless the project needs an approval status (`risk-tiers.md`):
+
+```markdown
+## Review packet: T0 · patch <patch-id[:12]> · head <sha[:12]>
+<what changed, one line>
+tests N passed · classifier T0 · deploy: <auto to env / none> · hold: no
+```
+
+### Batch approval (T1, and T0 where a status is needed)
+
+One question may approve up to 5 packets. It counts as one of the ≤3 decisions. T2 is never batched. The batch is only the question: each PR still has its own packet, posted on its PR and recorded by its own run with `record --artifact packet --pr N`, so each passed packet-check and CI before it is listed.
+
+```markdown
+Approve these 3 T1 patches? (approving merges)        ← that note only under merge_mode: bot
+- PR #N  patch <patch-id[:12]>  <one-line summary>  · evidence green · <packet link>
+- PR #M  patch <patch-id[:12]>  <one-line summary>  · evidence green · <packet link>
+Options: approve all / approve all except #N (say why) / hold all
+```
+
+Run `approve --pr` once per approved PR, in that PR's run. A PR whose patch changed or whose CI went red since the question is refused there and goes into the next question; a change requested on one PR leaves the others approved.
+
 The reviewer-map skill output is the agent-internal input to "Read these lines". Do not paste the whole map.
 
 ### Packet grammar and `packet-check`
@@ -108,6 +129,7 @@ FYI: <one line: what moved since last digest>
 Rules:
 - Send it as two parts: first the information (FYI line, "Do" actions and "Approve" pointers as plain text, with no questions), then the "Decide" and "Waiting on you" items on their own through the question tool.
 - Items 4+ wait for the next burst. Never pad with status.
-- "Approve" items count toward the 3 when they are T2. T1 approvals may be batched as one item ("approve 3 T1 packets").
+- "Approve" items count toward the 3 when they are T2. T0 and T1 approvals are batched as one item, in the batch question format above.
+- After a delegation window, the next digest's information part links its summary in one line ([delegation.md](delegation.md)).
 - Workers send the orchestrator five headed lines: STAGE, BLOCKED BY, MAINTAINER ACTION, WAITING ON OTHER SESSIONS, NEXT. The orchestrator verifies claims against GitHub before relaying.
 - When the human decides, the orchestrator writes it to the decision log first, then relays the log id, not a paraphrase.

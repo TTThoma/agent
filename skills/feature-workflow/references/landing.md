@@ -26,7 +26,7 @@ Every key is optional. A missing file or key takes the default, and JSON `null` 
 Placeholders, each with a fixed character set. A value outside its set is refused before anything runs, but only when a template that will run uses it:
 - `{pr}`: digits;
 - `{sha}` (local HEAD) and `{patch_id}`: hex;
-- `{approver}`: letters, digits, space and `. _ - ( ) '`;
+- `{approver}`: letters, digits, space and `. _ - ( ) '`, plus `:` after the first character (`delegated:<session>`, [delegation.md](delegation.md));
 - `{head_ref}` (current branch): `A-Z a-z 0-9 . _ / -`;
 - `{date}`: UTC timestamp.
 

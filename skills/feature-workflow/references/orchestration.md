@@ -28,6 +28,7 @@ Evidence from a 2026 multi-session study: five parallel sessions produced 90 orc
 - Own the human-action queue, migration and sequence-number allocation, and merge order (only the next PR in line rebases).
 - Send one digest per human attention burst, in the format in `human-surfaces.md`.
 - Verify worker claims against GitHub before relaying them.
+- Approve on the human's behalf only inside an opt-in delegation window, under its rubric ([delegation.md](delegation.md)).
 
 ## Direct human ↔ worker access
 

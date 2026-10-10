@@ -69,7 +69,7 @@ PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
 # Substituted values must stay inside these sets, so none can become an option, a path trick or shell syntax.
 VALUE_RES = {"pr": "[0-9]+", "sha": "[0-9a-f]{40,64}", "patch_id": "[0-9a-f]{40,64}", "date": "[0-9T:Z-]+",
-             "approver": r"[\w(][\w .()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
+             "approver": r"[\w(][\w .:()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_RES is the guard
 IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
