@@ -18,7 +18,8 @@ Every key is optional. A missing file or key takes the default, and JSON `null` 
 | `pr_head` | `gh pr view {pr} --json headRefOid -q .headRefOid` | read-only command that prints the PR head SHA |
 | `mark_ready` | `gh pr ready {pr}` | takes the PR out of draft |
 | `approval_status` | none | sets the approval record the merge bot or reviewer reads, e.g. `gh api repos/<o>/<r>/statuses/{sha} -f state=success -f context=maintainer-approval -f "description=patch {patch_id} approved by {approver}"` |
-| `required_checks` | `[]` | check names that must pass before merge. Recorded with each approval and carry |
+| `required_checks` | `[]` | check names that must pass before merge; `packet-check --pr` and `approve` refuse unless each one passed (when none are named, while any check is pending or failing). Recorded with each approval and carry |
+| `checks` | `gh pr checks {pr} --json name,bucket` | read-only; prints a JSON list of `{name, bucket}` for `packet-check` (`bucket`: pass, fail, pending, skipping or cancel). `null` means the project has no CI |
 | `retrigger` | none | re-requests a required check for the current head, e.g. a rerun of a dispatch workflow for `{head_ref}` `{sha}` |
 | `merge_mode` | none | `bot` (a merge bot lands it once checks and status are green) or `manual` (the human merges). Recorded with each approval and carry |
 

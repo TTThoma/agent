@@ -62,6 +62,18 @@ class RepoCase(unittest.TestCase):
         path.write_text(f"# {name}\n", encoding="utf-8")
         return path
 
+    def write_packet(self, *extra: str) -> Path:
+        """A packet that passes packet-check for the current head, patch and count."""
+        report = json.loads(self.workflow("status", "--json", check=False).stdout)
+        count = str(report["must_read_lines"])
+        if "--marked-lines" in extra:
+            count = f"{extra[extra.index('--marked-lines') + 1]} marked of {count}"
+        path = self.state_dir / "packet.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"## Review packet: {report['tier'].upper()} · patch {report['patch_id'][:12]} · head "
+                        f"{report['head_sha'][:12]}\n\n**Read these lines** ({count})\n", encoding="utf-8")
+        return path
+
     def write_rules(self, **overrides: object) -> Path:
         path = self.state_dir / "tiers.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +82,9 @@ class RepoCase(unittest.TestCase):
 
     def record(self, name: str, *extra: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         arguments = ["--artifact", name]
-        if name in {"brief", "verification", "cold-read", "packet", "approval"}:
+        if name == "packet":
+            arguments.extend(["--path", str(self.write_packet(*extra))])
+        elif name in {"brief", "verification", "cold-read", "approval"}:
             arguments.extend(["--path", str(self.write_artifact(name))])
         if name == "approval" and not extra:
             extra = ("--approver", "maintainer")
@@ -267,7 +281,8 @@ class WorkflowStateTest(RepoCase):
         files = {item["path"]: item for item in result["files"]}
         self.assertEqual(set(files), {"core/a.py", "tests/fixtures/f.json", "docs/guide.md"})
         self.assertEqual(set(files["core/a.py"]),
-                         {"path", "old_path", "added", "deleted", "binary", "tier", "skip_read", "must_read"})
+                         {"path", "old_path", "added", "deleted", "binary", "tier", "skip_read", "must_read",
+                          "whole_file", "excluded"})
         self.assertEqual((files["core/a.py"]["tier"], files["core/a.py"]["added"]), ("t2", 3))
         self.assertEqual((files["tests/fixtures/f.json"]["tier"], files["tests/fixtures/f.json"]["skip_read"]),
                          ("t0", True))
@@ -625,6 +640,10 @@ if command == "pr-head":
     print(pathlib.Path(sys.argv[3]).read_text().strip())
 if command == "move":  # a push lands while approve runs
     pathlib.Path(sys.argv[3]).write_text(sys.argv[4])
+if command == "checks":  # like `gh pr checks`: JSON on stdout, exit 8 while any check is pending
+    text = pathlib.Path(sys.argv[3]).read_text()
+    print(text)
+    sys.exit(8 if "pending" in text else 0)
 sys.exit(3 if command == "fail" else 0)
 """
 
@@ -643,15 +662,18 @@ class LandingTest(RepoCase):
         super().setUp()
         self.log = self.state_dir / "calls.jsonl"
         self.pr_head_file = self.state_dir / "pr-head"
+        self.checks_file = self.state_dir / "checks.json"
         stub = self.state_dir / "stub.py"
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text(STUB, encoding="utf-8")
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
         prefix = f"{shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(self.log))}"
         self.project = {
             "pr_head": f"{prefix} pr-head {shlex.quote(str(self.pr_head_file))} {{pr}}",
             "approval_status": f"{prefix} status {{sha}} {{patch_id}} {{approver}} {{date}}",
             "mark_ready": f"{prefix} ready {{pr}}",
             "merge_mode": "bot",
+            "checks": f"{prefix} checks {shlex.quote(str(self.checks_file))} {{pr}}",
         }
 
     def write_project(self, **overrides: object) -> Path:
@@ -691,8 +713,8 @@ class LandingTest(RepoCase):
         self.approved_run()
         report = self.status()
         self.assertEqual(report["artifacts"]["approval"]["status"], "current")
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
-        ready, status = self.calls()[1], self.calls()[3]
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks", "ready", "pr-head", "status"])
+        ready, status = self.calls()[2], self.calls()[4]
         self.assertEqual(status[:4], ["status", self.head(), report["patch_id"], "Ann Lee"])  # one argv element
         self.assertEqual(ready, ["ready", "7"])
         approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
@@ -786,7 +808,7 @@ class LandingTest(RepoCase):
         self.publish_head()
         self.assertIn("notes.txt changed and not skip-read", self.land("carry").stderr)
         self.assertEqual(self.status()["artifacts"]["approval"]["status"], "stale")
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks", "ready", "pr-head", "status"])
 
     def test_carry_after_identical_rebase_resets_status(self) -> None:
         self.approved_run()
@@ -980,6 +1002,289 @@ class LandingTest(RepoCase):
         self.exec_cmd("git", "commit", "-q", "-m", "symlinked config")
         with self.assertRaisesRegex(module.WorkflowError, "not a regular file"):
             module.project_config(self.repo, None, self.head())
+
+    # packet-check: the four pilot errors (wrong head, stale patch-id, wrong count, CI pending) are refused.
+    def packet_run(self, checks: list[dict] | None = None) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\nlimit = 2\n", "core")
+        for name in ("build", "verification", "cold-read"):
+            self.record(name)
+        self.publish_head()
+        self.checks_file.write_text(json.dumps(checks or [{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
+
+    def packet(self, head: str | None = None, patch: str | None = None, count: object = None) -> Path:
+        report = self.status()
+        count = report["must_read_lines"] if count is None else count
+        path = self.state_dir / "packet-draft.md"
+        path.write_text(f"## Review packet: T2 · patch {patch or report['patch_id'][:12]} · head "
+                        f"{head or report['head_sha'][:12]}\n\n**What changed**\n- a limit\n\n"
+                        f"**Read these lines** ({count})\n| core/engine.py:1-2 | the limit | is 2 right? |\n",
+                        encoding="utf-8")
+        return path
+
+    def packet_check(self, packet: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.workflow("packet-check", "--packet", str(packet), "--project", str(self.write_project()),
+                             *extra, check=False)
+
+    def test_packet_check_passes_a_matching_packet(self) -> None:
+        self.packet_run()
+        self.project["required_checks"] = ["ci"]
+        result = self.packet_check(self.packet(), "--pr", "7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("packet-check ok", result.stdout)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks"])  # reads only, posts nothing
+        self.assertEqual(self.status()["artifacts"]["packet"]["status"], "absent")
+
+    def test_packet_check_refuses_wrong_head(self) -> None:
+        self.packet_run()
+        wrong = self.packet_check(self.packet(head="0123456789ab"))
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("packet head 0123456789ab is not the worktree HEAD", wrong.stderr)
+        self.pr_head_file.write_text("f" * 40 + "\n", encoding="utf-8")
+        unpushed = self.packet_check(self.packet(), "--pr", "7")
+        self.assertIn("is not the PR head", unpushed.stderr)
+
+    def test_packet_check_refuses_stale_patch_and_ledger(self) -> None:
+        self.packet_run()
+        stale = self.packet()
+        self.commit("core/engine.py", "route = 1\nlimit = 3\n", "review fix")
+        result = self.packet_check(stale)
+        self.assertIn("is not the current patch-id", result.stderr)
+        self.assertIn("verification is stale", result.stderr)
+        for name in ("build", "verification", "cold-read"):
+            self.record(name)
+        self.assertIn("is not the current patch-id", self.packet_check(stale).stderr)
+        self.assertEqual(self.packet_check(self.packet()).returncode, 0)
+
+    def draft(self, text: str) -> Path:
+        path = self.state_dir / "packet-draft.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def title(self) -> str:
+        report = self.status()
+        return f"## Review packet: T2 · patch {report['patch_id'][:12]} · head {report['head_sha'][:12]}"
+
+    def test_packet_check_marker_grammar(self) -> None:
+        self.packet_run()
+        self.assertIn("packet must-read 3 is not the counted 2", self.packet_check(self.packet(count=3)).stderr)
+        self.assertIn("malformed marker", self.packet_check(self.packet(count="")).stderr)
+        self.assertIn("malformed marker", self.packet_check(self.packet(count="2,")).stderr)
+        quoted = self.draft(f"{self.title()}\n> **Read these lines** (2)\n")
+        self.assertIn("no '**Read these lines** (N)' line", self.packet_check(quoted).stderr)
+        loose = self.draft(f"\ufeff\n\n{self.title()}\nmore text\n**Read these lines** (2) below\n")
+        self.assertEqual(self.packet_check(loose).returncode, 0, self.packet_check(loose).stderr)
+
+    def test_packet_check_needs_a_recorded_override(self) -> None:
+        self.packet_run()
+        unrecorded = self.packet_check(self.packet(count="1 marked of 2"))
+        self.assertIn("override not recorded", unrecorded.stderr)
+
+    def test_packet_check_states_of_checks(self) -> None:
+        self.packet_run([{"name": "ci", "bucket": "pending"}, {"name": "lint", "bucket": "pass"}])
+        self.assertIn("check ci is pending", self.packet_check(self.packet(), "--pr", "7").stderr)
+        for rows, message in (([{"name": "lint", "bucket": "fail"}], "check lint is failing"),
+                              ([{"name": "lint", "bucket": "weird"}], "unknown state 'weird'"),
+                              ([], "no checks reported")):
+            self.checks_file.write_text(json.dumps(rows), encoding="utf-8")
+            self.assertIn(message, self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.checks_file.write_text("no checks reported on the 'feature' branch", encoding="utf-8")
+        self.assertIn("no checks reported;", self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "skipping"}]), encoding="utf-8")
+        self.assertEqual(self.packet_check(self.packet(), "--pr", "7").returncode, 0)  # skipped, not required
+        self.project["required_checks"] = ["ci", "lint"]
+        result = self.packet_check(self.packet(), "--pr", "7")
+        self.assertIn("required check ci has not reported", result.stderr)
+        self.assertIn("required check lint is skipped", result.stderr)
+        self.project["checks"] = None  # the project has no CI
+        no_ci = self.packet_check(self.packet(), "--pr", "7")
+        self.assertEqual(no_ci.returncode, 0, no_ci.stderr)
+        self.assertIn("no CI", no_ci.stdout)
+
+    def test_record_packet_runs_packet_check(self) -> None:
+        self.packet_run([{"name": "ci", "bucket": "pending"}])
+        wrong = self.packet(head="0123456789ab")
+        args = ("record", "--artifact", "packet", "--path", str(wrong))
+        self.assertIn("packet-check refused", self.workflow(*args, check=False).stderr)
+        pending = ("record", "--artifact", "packet", "--path", str(self.packet()), "--pr", "7", "--project",
+                   str(self.write_project()))
+        self.assertIn("check ci is pending", self.workflow(*pending, check=False).stderr)
+        self.packet(head="0123456789ab")
+        self.workflow(*args, "--skip-packet-check", "head typo, fixed in the posted comment")
+        packet = self.status()["artifacts"]["packet"]
+        self.assertEqual(packet["packet_check_skipped"], "head typo, fixed in the posted comment")
+        self.assertIn("[packet-check skipped: head typo", self.workflow("status").stdout)
+        self.assertIn("apply only to the packet", self.record("approval", "--approver", "ann", "--pr", "7",
+                                                              check=False).stderr)
+
+    def ready_run(self) -> None:
+        self.packet_run()
+        self.record("packet")
+
+    def test_approve_refuses_before_ci_is_green(self) -> None:
+        self.ready_run()
+        self.assertIn("[PR/CI not checked]", self.workflow("status").stdout)
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pending"}]), encoding="utf-8")
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("cannot approve before CI is green: check ci is pending", refused.stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "checks"])  # nothing set, nothing ready
+        self.project["required_checks"] = ["deploy"]
+        self.checks_file.write_text(json.dumps([{"name": "ci", "bucket": "pass"}]), encoding="utf-8")
+        self.assertIn("required check deploy has not reported", self.land("approve", "--approver", "ann").stderr)
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+        self.project["checks"] = None
+        self.assertEqual(self.land("approve", "--approver", "ann").returncode, 0)
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertIn("no CI", approval["checks_note"])
+
+    def test_approve_refuses_a_packet_that_skipped_packet_check(self) -> None:
+        self.packet_run()
+        wrong = self.packet(head="0123456789ab")
+        self.workflow("record", "--artifact", "packet", "--path", str(wrong), "--skip-packet-check", "typo")
+        self.assertIn("--allow-skipped-packet-check", self.land("approve", "--approver", "ann").stderr)
+        allowed = self.land("approve", "--approver", "ann", "--allow-skipped-packet-check")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
+        self.assertTrue(approval["allow_skipped_packet_check"])
+
+    def test_packet_title_suffix_and_fenced_markers(self) -> None:
+        self.packet_run()
+        text = f"{self.title()} (rev 2)\n```\n**Read these lines** (99)\n```\n**Read these lines** (2)\n"
+        result = self.packet_check(self.draft(text), "--pr", "7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.workflow("record", "--artifact", "packet", "--path", str(self.draft(text)), "--pr", "7", "--project",
+                      str(self.write_project()))
+        self.assertNotIn("[PR/CI not checked]", self.workflow("status").stdout)
+
+    def test_packet_check_refuses_before_cold_read(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification"):
+            self.record(name)
+        self.assertIn("cold-read is absent", self.packet_check(self.packet()).stderr)
+
+
+BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
+BODY = "".join(f"    total = total + compute_value(item, {i})\n" for i in range(6))
+
+
+class MustReadTest(RepoCase):
+    """Only blocks of >= 5 lines moved unchanged between must-read files are excluded; nothing else."""
+
+    def classify(self) -> dict:
+        return json.loads(self.workflow("classify").stdout)
+
+    def change(self, base: dict[str, str], head: dict[str, str]) -> dict:
+        self.commit_base_rules()
+        for name, text in base.items():
+            self.commit(name, text, "base")
+        self.advance_base()
+        self.init("t2")
+        for name, text in head.items():
+            if text is None:
+                self.exec_cmd("git", "rm", "-q", name)
+                self.exec_cmd("git", "commit", "-qm", "remove")
+            else:
+                self.commit(name, text, "head")
+        return self.classify()
+
+    def test_block_moved_between_must_read_files_is_excluded(self) -> None:
+        result = self.change({"core/fetch.py": "import os\n\n\n" + BLOCK, "core/common.py": "import sys\n"},
+                             {"core/fetch.py": "import os\n",
+                              "core/common.py": "import sys\n\n\n" + BLOCK + "def added():\n    return 1\n"})
+        self.assertEqual(sum(item["added"] + item["deleted"] for item in result["files"]), 38)
+        self.assertEqual(result["must_read_excluded"], {"moved": 34})
+        self.assertEqual(result["must_read_lines"], 4)  # an anchor where it left, one where it landed, 2 new lines
+
+    def test_line_edited_inside_a_moved_block_still_counts(self) -> None:
+        self.change({"core/fetch.py": BLOCK}, {"core/fetch.py": "", "core/common.py": BLOCK.replace("+ 2\n", "+ 20\n")})
+        module = load_module()
+        base = self.exec_cmd("git", "rev-parse", "origin/main").stdout.strip()
+        lines = [line for section in module.moved_sections(self.repo, base, self.head(), []) for line in section]
+        edited = [(sign, code in module.MOVED_CODES) for sign, code, text in lines if b"(value) + 2" in text]
+        self.assertEqual(sorted(edited), [(b"+", False), (b"-", False)])
+        self.assertGreaterEqual(self.classify()["must_read_lines"], 4)
+
+    def test_short_move_counts_on_both_sides(self) -> None:
+        view = "def view(request):\n    require_admin_permission(request)\n    return render(request)\n"
+        result = self.change({"core/a.py": view, "core/b.py": "def helper():\n    return 1\n"},
+                             {"core/a.py": view.replace("    require_admin_permission(request)\n", ""),
+                              "core/b.py": "def helper():\n    require_admin_permission(request)\n    return 1\n"})
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (2, 0))
+
+    def test_four_line_move_counts_on_both_sides(self) -> None:
+        checks = "".join(f"    require_permission_number_{i}(request)\n" for i in range(4))
+        result = self.change({"core/a.py": "def view(request):\n" + checks + "    return 1\n", "core/b.py": "x = 1\n"},
+                             {"core/a.py": "def view(request):\n    return 1\n", "core/b.py": "x = 1\n" + checks})
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (8, 0))
+
+    def test_move_within_one_file_counts_in_full(self) -> None:
+        parts = BLOCK.split("\n\n\n")[:4]
+        reordered = "\n\n\n".join(parts[2:] + parts[:2]) + "\n\n\n"
+        result = self.change({"core/order.py": BLOCK}, {"core/order.py": reordered})
+        self.assertEqual(result["must_read_excluded"]["moved"], 0)
+
+    def test_dedent_and_unwrap_count_in_full(self) -> None:
+        loop = "def run(items):\n    total = 0\n    for item in items:\n" \
+            + "    " + BODY.replace("\n    ", "\n        ")
+        flat = "def step(item, total):\n" + BODY
+        yaml_old = "jobs:\n  test:\n    steps:\n" + "".join(f"      - run: make target-number-{i}\n" for i in range(6))
+        yaml_new = "steps:\n" + "".join(f"  - run: make target-number-{i}\n" for i in range(6))
+        unwrap_old = "def guard(user):\n    if user.is_admin:\n" + BODY.replace("    ", "        ")
+        unwrap_new = "def guard(user):\n" + BODY
+        result = self.change({"core/loop.py": loop, "core/ci.yml": yaml_old, "core/guard.py": unwrap_old},
+                             {"core/loop.py": "def run(items):\n    total = 0\n", "core/step.py": flat,
+                              "core/ci.yml": None, "core/steps.yml": yaml_new, "core/guard.py": unwrap_new})
+        self.assertEqual(result["must_read_excluded"]["moved"], 0)  # every re-indented line is a changed line
+        self.assertEqual(result["must_read_lines"], sum(item["added"] + item["deleted"] for item in result["files"]))
+
+    def test_block_moved_from_a_skip_read_file_counts_in_full(self) -> None:
+        result = self.change({"tests/fixtures/helpers.py": BLOCK},
+                             {"tests/fixtures/helpers.py": None, "core/helpers.py": BLOCK})
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (16, 0))
+
+    def test_unchanged_rename_into_must_read_counts_in_full(self) -> None:
+        rules = RULES | {"rules": RULES["rules"] + [{"glob": "vendor/**", "tier": "t2", "skip_read": True}]}
+        self.commit_base_rules(**rules)
+        self.commit("vendor/lib.py", BLOCK, "t2 skip-read source")
+        self.commit("docs/lib.py", BLOCK, "t1 source")
+        self.advance_base()
+        self.init("t2")
+        (self.repo / "core").mkdir()
+        self.exec_cmd("git", "mv", "vendor/lib.py", "core/lib.py")
+        self.exec_cmd("git", "mv", "docs/lib.py", "core/doc_lib.py")
+        self.exec_cmd("git", "commit", "-m", "renames")
+        files = {item["path"]: item for item in self.classify()["files"]}
+        for name in ("core/lib.py", "core/doc_lib.py"):  # skip-read ranks below must-read t2
+            self.assertEqual((files[name]["must_read"], files[name]["whole_file"]), (16, True), name)
+
+    def test_status_shows_counts_and_who_recorded(self) -> None:
+        self.change({"core/f.py": "x = 1\n"}, {"core/f.py": "x = 2\n"})
+        self.workflow("record", "--artifact", "brief", "--path", str(self.write_artifact("brief")))
+        bad = self.workflow("record", "--artifact", "build", "--recorded-by", "impl ementer", check=False)
+        self.assertIn("--recorded-by must match", bad.stderr)
+        self.workflow("record", "--artifact", "build", "--recorded-by", "implementer")
+        self.workflow("invalidate", "--from", "build", "--reason", "bell\x07 and\x1b[31m colour")
+        text = self.workflow("status", check=False).stdout
+        self.assertIn("must-read: 2 counted (+1/-1), 0 excluded (moved 0)", text)
+        self.assertRegex(text, r"build: stale \[recorded by implementer at 20")
+        self.assertIn("bell\\x07 and\\x1b[31m colour", text)
+        self.assertNotIn("\x1b", text)
+
+    def test_shared_brief_warns_other_open_run(self) -> None:
+        shared = self.repo.parent / f"{self.repo.name}-brief.md"
+        shared.write_text("# shared brief\n", encoding="utf-8")
+        self.addCleanup(shared.unlink)
+        self.init("t2")
+        first = self.workflow("record", "--artifact", "brief", "--path", str(shared))
+        self.assertNotIn("warning", first.stderr)
+        other = ("--slug", "other-run", "--state-dir", str(self.repo / ".git" / "fw-other"))
+        self.exec_cmd(sys.executable, str(SCRIPT), "init", *other, "--source", "x", "--base-ref", "origin/main")
+        second = self.exec_cmd(sys.executable, str(SCRIPT), "record", *other, "--artifact", "brief", "--path",
+                               str(shared))
+        self.assertIn("warning: open run feature-workflow-test also records its brief", second.stderr)
 
 
 if __name__ == "__main__":

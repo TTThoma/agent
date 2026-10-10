@@ -48,6 +48,14 @@ Tiers are per file, so when a file mixes registration rows with policy, mark it 
 
 The first matching rule wins. The ledger's `classify` command prints per-file tiers, the floor and the must-read line count; `record --artifact packet` refuses when the tier is below the floor or a T2 run is over budget. A maintainer-approved override, `--marked-lines N --budget-override-reason`, lets one packet revision count the lines it marks as must-read (N ≤ budget); it is logged in `budget_overrides` and never touches the floor. Changing the in-tree fallback is itself a T2 change: it moves the trust boundary.
 
+Must-read may exclude only lines that cannot change behaviour, so every changed line counts, with one exception: an unchanged block of ≥5 lines moved from one must-read file to another counts one anchor line on each side instead of all its lines. `status` reports `must-read: N counted, M excluded (moved M)`. In detail:
+- a run of ≥5 consecutive lines that git marks as moved (`--color-moved=zebra --color-moved-ws=no`: blocks of ≥20 alphanumerics, with no whitespace allowance, so any re-indent is a change), removed from one must-read file and added, byte-identical, to a different must-read file;
+- each excluded block keeps one counted anchor line on both sides, so the reader sees where the code left and where it arrived;
+- a move within one file (a reorder, such as moving a check after the code it guards) counts in full, as do shorter moves, edited lines inside a moved block, and blocks moved out of or into a skip-read or lower-tier file;
+- a file renamed into a must-read path from a lower tier or a skip-read path counts in full, even unchanged: nobody read it at that tier. A rename between must-read paths counts only its changed lines.
+
+Whitespace-only and formatting changes are not excluded: a trailing space after a shell `\`, a blank line in a triple-quoted string or a YAML `|` block, and a space in a SQL literal all change behaviour. Any doubt in parsing git's output leaves the raw count. A budget override recorded before this rule stores the old count, so it no longer matches; overrides are per run, so an in-flight run re-records its packet.
+
 ## Split rules
 
 When must-read lines exceed the budget, or a PR mixes tiers, cut it into a stack in this order:

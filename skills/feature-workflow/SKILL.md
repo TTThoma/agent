@@ -33,7 +33,7 @@ Rules for every message to the human:
 
 The ledger records the shape stage's output as artifact `brief`.
 
-Ledger: `python3 <skill-dir>/scripts/workflow_state.py {init|status|record|approve|carry|classify|set-tier|invalidate|where} ...`. It stores state under the worktree's Git metadata. When `<repo>/.feature-workflow/tiers.json` exists, it also enforces the tier floor and the must-read budget.
+Ledger: `python3 <skill-dir>/scripts/workflow_state.py {init|status|record|packet-check|approve|carry|classify|set-tier|invalidate|where} ...`. It stores state under the worktree's Git metadata. When `<repo>/.feature-workflow/tiers.json` exists, it also enforces the tier floor and the must-read budget.
 
 ## Stages
 

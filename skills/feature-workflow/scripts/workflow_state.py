@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import copy
 import fcntl
 import hashlib
@@ -60,8 +61,9 @@ PROJECT_DEFAULTS: dict[str, Any] = {
     "retrigger": None,
     "required_checks": [],
     "merge_mode": None,
+    "checks": "gh pr checks {pr} --json name,bucket",
 }
-TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger")
+TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger", "checks")
 MERGE_MODES = ("bot", "manual")
 PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
@@ -72,6 +74,21 @@ SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_R
 IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
 HUNK_HEADER_RE = re.compile(rb"^@@ [^\n]*", re.M)
+# Moved-line detection: pin every colour git uses, so each +/- line starts with one known code.
+MOVE_COLOURS = {"old": "red", "new": "green", "oldMoved": "magenta", "oldMovedAlternative": "blue",
+                "newMoved": "cyan", "newMovedAlternative": "yellow", "meta": "normal", "frag": "normal",
+                "func": "normal", "context": "normal", "commit": "normal", "whitespace": "normal"}
+MOVE_CONFIG = [arg for key, colour in MOVE_COLOURS.items() for arg in ("-c", f"color.diff.{key}={colour}")] \
+    + ["-c", "diff.suppressBlankEmpty=false"]
+MOVED_CODES = {b"35", b"34", b"36", b"33"}
+# No whitespace allowance (and any diff.colorMovedWS config overridden): a re-indented line is a changed line.
+MOVE_FLAGS = ("--color=always", "--color-moved=zebra", "--color-moved-ws=no", "--ws-error-highlight=none")
+MIN_MOVED_BLOCK = 5
+HUNK_RE = re.compile(rb"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", re.S)
+RECORDED_BY_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+DIFF_LINE_RE = re.compile(rb"(?:\x1b\[([0-9;]+)m)?([ +\-])(.*?)(?:\x1b\[m)?", re.S)
+EXCLUSIONS = ("moved",)
 
 
 class WorkflowError(RuntimeError):
@@ -366,28 +383,121 @@ def path_tier(rules: dict[str, Any] | None, path: str) -> tuple[str, bool]:
     return rules["default_tier"], False
 
 
-def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | None) -> dict[str, Any]:
-    raw = git_bytes(repo, "diff", *DIFF_FLAGS, "--numstat", "-z", base_sha, head_sha)
+def numstat(repo: Path, base_sha: str, head_sha: str, specs: list[str] | None = None) -> list[tuple[str, ...]]:
+    """(added, deleted, path, old_path) per file pair, in git's order; added is "-" for a binary file."""
+    raw = git_bytes(repo, "diff", *DIFF_FLAGS, "--numstat", "-z", base_sha, head_sha, "--", *(specs or []))
     tokens = raw.decode("utf-8", errors="surrogateescape").split("\0")
-    files: list[dict[str, Any]] = []
-    floor: str | None = None
-    added_total = deleted_total = 0
-    index = 0
+    entries, index = [], 0
     while index < len(tokens):
         entry, index = tokens[index], index + 1
         if not entry:
             continue
         added, deleted, path = entry.split("\t", 2)
-        old_path = None
+        old_path = ""
         if not path:  # rename: "added\tdeleted\t\0old\0new"
             old_path, path, index = tokens[index], tokens[index + 1], index + 2
+        entries.append((added, deleted, path, old_path))
+    return entries
+
+
+def moved_sections(repo: Path, base_sha: str, head_sha: str, specs: list[str]) -> list[list[tuple]]:
+    """Per file pair, its hunk lines as (sign, colour code, content). Git colours a line as moved when an
+    identical block (>= 20 alphanumerics) is removed in one place and added in another within these files."""
+    out = git_bytes(repo, "-c", "core.quotePath=false", *MOVE_CONFIG, "diff", *DIFF_FLAGS, *MOVE_FLAGS,
+                    base_sha, head_sha, "--", *specs)
+    sections: list[list[tuple]] = []
+    old_left = new_left = 0
+    for raw in out.split(b"\n"):
+        if old_left > 0 or new_left > 0:
+            match = DIFF_LINE_RE.fullmatch(raw)
+            if not match:
+                if raw.lstrip(b"\x1b[m").startswith(b"\\"):  # "\ No newline at end of file"
+                    continue
+                raise WorkflowError(f"unparsed diff line {raw[:60]!r}")
+            code, sign, content = match.groups()
+            old_left -= sign != b"+"
+            new_left -= sign != b"-"
+            sections[-1].append((sign, code, content))
+        elif raw.startswith(b"diff --git "):
+            sections.append([])
+        elif raw.startswith(b"@@") and sections:
+            hunk = HUNK_RE.fullmatch(raw)
+            if not hunk:
+                raise WorkflowError(f"unparsed hunk header {raw[:60]!r}")
+            old_left, new_left = (int(value) if value is not None else 1 for value in hunk.groups())
+            sections[-1].append((b" ", None, b""))  # a hunk boundary ends any run
+    return sections
+
+
+def moved_runs(lines: list[tuple]) -> list[tuple[bytes, int, bytes]]:
+    """Runs of consecutive moved lines with one sign and one zebra colour: (sign, length, wrapped text)."""
+    runs: list[tuple[bytes, bytes | None, list[bytes]]] = []
+    previous_moved = False
+    for sign, code, content in lines:
+        moved = sign != b" " and code in MOVED_CODES
+        if moved and runs and runs[-1][:2] == (sign, code) and previous_moved:
+            runs[-1][2].append(content)
+        elif moved:
+            runs.append((sign, code, [content]))
+        previous_moved = moved
+    return [(sign, len(body), b"\n" + b"\n".join(body) + b"\n") for sign, _, body in runs]
+
+
+def moved_out(index: int, runs: list[list[tuple[bytes, int, bytes]]]) -> tuple[int, int]:
+    """(added, deleted) lines of file `index` excluded as moved: only runs of >= MIN_MOVED_BLOCK lines whose
+    opposite side is in a different file, and never one that also matches within its own file (a reorder).
+    Each excluded run keeps one counted anchor line, so the reader sees where code left and where it landed."""
+    excluded = {b"+": 0, b"-": 0}
+    for sign, length, text in runs[index]:
+        if length < MIN_MOVED_BLOCK:
+            continue
+        def found(file_runs: list[tuple[bytes, int, bytes]]) -> bool:
+            return any(other != sign and text in body for other, _, body in file_runs)
+        if not found(runs[index]) and any(found(file_runs) for at, file_runs in enumerate(runs) if at != index):
+            excluded[sign] += length - 1
+    return excluded[b"+"], excluded[b"-"]
+
+
+def exclude(repo: Path, base_sha: str, head_sha: str, files: list[dict[str, Any]]) -> str | None:
+    """Lower each diff-counted file's must-read by blocks moved between must-read files; any parse doubt leaves
+    the raw count. Returns a note when exclusion was skipped."""
+    plain = [item for item in files if item["must_read"] and not item["whole_file"]]
+    if not plain:
+        return None
+    specs = [f":(literal){name}" for item in plain for name in (item["old_path"], item["path"]) if name]
+    try:
+        entries = numstat(repo, base_sha, head_sha, specs)
+        sections = moved_sections(repo, base_sha, head_sha, specs)
+    except WorkflowError as exc:
+        return f"no exclusions: {exc}"
+    if len(entries) != len(sections):
+        return "no exclusions: diff sections do not line up with numstat"
+    by_path = {item["path"]: item for item in plain}
+    runs = [moved_runs(lines) for lines in sections]
+    for index, ((added, deleted, path, old_path), lines) in enumerate(zip(entries, sections)):
+        item = by_path.get(path)
+        signs = [line[0] for line in lines]
+        if item is None or (old_path or None) != item["old_path"] or added == "-" \
+                or (int(added), int(deleted)) != (signs.count(b"+"), signs.count(b"-")):
+            continue  # unmatched or a different pairing: keep the raw count
+        moved_added, moved_deleted = moved_out(index, runs)
+        item.update({"must_read": item["must_read"] - moved_added - moved_deleted,
+                     "read_added": item["added"] - moved_added, "read_deleted": item["deleted"] - moved_deleted,
+                     "excluded": {"moved": moved_added + moved_deleted}})
+    return None
+
+
+def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | None) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    floor: str | None = None
+    for added, deleted, path, old_path in numstat(repo, base_sha, head_sha):
         binary = added == "-"
-        item = {"path": path, "old_path": old_path,
+        item = {"path": path, "old_path": old_path or None,
                 "added": 0 if binary else int(added), "deleted": 0 if binary else int(deleted)}
         # A rename is judged by both paths: the higher tier, and skipped only if both paths skip.
         tier, skip = path_tier(rules, path)
         old_counts = False
-        if old_path is not None:
+        if old_path:
             old_tier, old_skip = path_tier(rules, old_path)
             old_counts = old_tier == "t2" and not old_skip
             if TIERS.index(old_tier) > TIERS.index(tier):
@@ -397,21 +507,27 @@ def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | N
             floor = tier
         counts = tier == "t2" and not skip
         read_added, read_deleted = (item["added"], item["deleted"]) if counts else (0, 0)
+        whole = counts and (binary or (bool(old_path) and not old_counts))
         if counts and binary:  # unreadable as a diff: the whole old and new content is must-read
             read_added = blob_lines(repo, head_sha, path)
             read_deleted = blob_lines(repo, base_sha, old_path or path)
-        elif counts and old_path is not None and not old_counts:  # moved into must-read: read all of it
+        elif whole:  # renamed into must-read from a lower tier or a skip-read path: read all of it, even unchanged
             read_added = blob_lines(repo, head_sha, path)
-        added_total += read_added
-        deleted_total += read_deleted
-        files.append({**item, "binary": binary, "tier": tier, "skip_read": skip,
-                      "must_read": read_added + read_deleted})
+        files.append({**item, "binary": binary, "tier": tier, "skip_read": skip, "whole_file": whole,
+                      "must_read": read_added + read_deleted, "read_added": read_added, "read_deleted": read_deleted,
+                      "excluded": dict.fromkeys(EXCLUSIONS, 0)})
+    note = exclude(repo, base_sha, head_sha, files)
+    excluded = {key: sum(item["excluded"][key] for item in files) for key in EXCLUSIONS}
+    added_total = sum(item.pop("read_added") for item in files)
+    deleted_total = sum(item.pop("read_deleted") for item in files)
     return {
         "files": files,
         "path_floor": floor,
         "must_read_lines": added_total + deleted_total,
         "must_read_added": added_total,
         "must_read_deleted": deleted_total,
+        "must_read_excluded": excluded,
+        "must_read_note": note,
         "must_read_budget": rules["budget"] if rules else None,
         "rules_path": rules["path"] if rules else None,
     }
@@ -596,7 +712,10 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         hard[name] = bool(reasons)
         status = "missing" if missing else ("stale" if reasons or moved else "current")
         statuses[name] = {"status": status, "reasons": sorted(reasons | moved), "notes": sorted(notes),
-                          "required": name in required}
+                          "required": name in required, "recorded_at": record.get("recorded_at"),
+                          "recorded_by": record.get("recorded_by") or record.get("approver"),
+                          "packet_check_skipped": (record.get("packet_check") or {}).get("skipped"),
+                          "pr_checked": bool((record.get("packet_check") or {}).get("pr"))}
 
     next_artifact = next((name for name in ARTIFACT_ORDER
                           if name in required and statuses[name]["status"] != "current"), None)
@@ -612,6 +731,8 @@ def evaluate(state: dict[str, Any], repo: Path, current: dict[str, Any] | None =
         "must_read_lines": classified["must_read_lines"],
         "must_read_added": classified["must_read_added"],
         "must_read_deleted": classified["must_read_deleted"],
+        "must_read_excluded": classified["must_read_excluded"],
+        "must_read_note": classified["must_read_note"],
         "must_read_budget": classified["must_read_budget"],
         "rules_path": classified["rules_path"],
         "rules_sha256": classified["rules_sha256"],
@@ -792,6 +913,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         raise WorkflowError(f"{artifact} requires --path")
     if artifact == "approval" and not args.approver:
         raise WorkflowError("approval requires --approver <name>")
+    if args.recorded_by is not None and not RECORDED_BY_RE.fullmatch(args.recorded_by):
+        raise WorkflowError("--recorded-by must match [A-Za-z0-9._:-]{1,64}")
+    if artifact != "packet" and (args.pr or args.project or args.skip_packet_check is not None):
+        raise WorkflowError("--pr, --project and --skip-packet-check apply only to the packet")
 
     repo, path, state = open_run(args)
     if (state["artifacts"].get("published") or {}).get("landing") == "squash" and artifact != "published":
@@ -812,7 +937,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                 if override["marked_lines"] > report["must_read_budget"]:
                     raise WorkflowError(f"cannot record packet; --marked-lines {override['marked_lines']} exceeds "
                                         f"budget {report['must_read_budget']}")
-                override["must_read_lines"] = report["must_read_lines"]
+                override.update({"must_read_lines": report["must_read_lines"], "patch_id": report["patch_id"]})
                 continue
             raise WorkflowError(f"cannot record {artifact}; {gate['gate']}: {gate['detail']}"
                                 + ("; or mark lines with --marked-lines and --budget-override-reason"
@@ -850,7 +975,21 @@ def cmd_record(args: argparse.Namespace) -> int:
             os.replace(temporary, resolved)
         resolved_path = str(resolved)
 
-    extra: dict[str, Any] = {"source_path": source} if artifact == "brief" else {}
+    extra: dict[str, Any] = {"source_path": source, "recorded_by": args.recorded_by} if artifact == "brief" \
+        else {"recorded_by": args.recorded_by}
+    if artifact == "packet":  # the packet-check gate; the hash is of the bytes that were checked
+        data, text = read_packet(Path(resolved_path or ""))
+        problems = packet_problems(text, state, report, override)
+        found, note = pr_problems(repo, args.project, args.pr, report) if args.pr else ([], "")
+        problems += found
+        if problems and not (args.skip_packet_check or "").strip():
+            raise WorkflowError("cannot record packet; packet-check refused (or pass --skip-packet-check REASON):"
+                                "\n- " + "\n- ".join(problems))
+        extra.update({"sha256": hashlib.sha256(data).hexdigest(), "packet_check": {
+            "pr": args.pr, "note": note or None, "skipped": args.skip_packet_check if problems else None,
+            "overridden": problems}})
+    if source:
+        warn_shared_brief(repo, path, source)
     if artifact == "approval":
         extra.update({"approver": args.approver, "evidence_url": args.evidence_url})
     if override:
@@ -863,6 +1002,22 @@ def cmd_record(args: argparse.Namespace) -> int:
             extra.update({"remote_sha": merge_patch[0], "merge_patch_id": merge_patch[1]})
     emit(store(state, path, artifact, report, resolved_path, extra))
     return 0
+
+
+def warn_shared_brief(repo: Path, path: Path, source: str) -> None:
+    """Each run snapshots its brief; several open runs pointed at one mutable file is still a smell."""
+    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    found = {*common.glob("feature-workflow/*/state.json"), *common.glob("worktrees/*/feature-workflow/*/state.json"),
+             *path.parent.parent.glob("*/state.json")} - {path}
+    for other in sorted(found):
+        try:
+            artifacts = json.loads(other.read_text(encoding="utf-8")).get("artifacts", {})
+        except (OSError, ValueError):
+            continue
+        if (artifacts.get("brief") or {}).get("source_path") == source and "published" not in artifacts:
+            print(f"warning: open run {other.parent.name} also records its brief from {source}; give each run its "
+                  "own brief file (each run keeps a snapshot, so later edits there do not reach this run)",
+                  file=sys.stderr)
 
 
 def store(state: dict[str, Any], path: Path, artifact: str, report: dict[str, Any], file_path: str | None,
@@ -959,11 +1114,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
     refuse_closed(state)
     report = evaluate(state, repo)
     require_current(report, state, "approval")
+    skipped = (state["artifacts"]["packet"].get("packet_check") or {}).get("skipped")
+    if skipped and not args.allow_skipped_packet_check:
+        raise WorkflowError(f"the packet was recorded with --skip-packet-check ({skipped}); re-record it, or pass "
+                            "--allow-skipped-packet-check")
     plan = landing_plan(repo, args, report, args.approver, ("mark_ready", "approval_status"))
     if plan is None:
         return 0
     values, steps, landing = plan
     check_pr_head(repo, steps["pr_head"], values["sha"])
+    ci, ci_note = check_problems(repo, project_config(repo, args.project, report["base_sha"]), values)
+    if ci:
+        raise WorkflowError("cannot approve before CI is green: " + "; ".join(ci))
     done = [run_command(repo, steps["mark_ready"])] if "mark_ready" in steps else []
     check_pr_head(repo, steps["pr_head"], values["sha"], "it moved after mark_ready; no approval status set")
     with ledger_lock(path):
@@ -985,7 +1147,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
         lines += [f"- `{shlex.join(item['argv'])}` exit 0 {item['stdout']}".rstrip() for item in done]
         note.write_text("\n".join(lines) + "\n", encoding="utf-8")
         extra = {"approver": args.approver, "evidence_url": args.evidence_url, "pr": args.pr, "landing": landing,
-                 "commands": done}
+                 "commands": done, "checks_note": ci_note or None,
+                 "allow_skipped_packet_check": bool(args.allow_skipped_packet_check)}
         emit(store(state, path, "approval", report, str(note), extra))
     return 0
 
@@ -1071,12 +1234,160 @@ def cmd_carry(args: argparse.Namespace) -> int:
     return 0
 
 
+PACKET_TITLE_RE = re.compile(r"## Review packet: (T[0-2]) · patch ([0-9a-f]{7,40}|empty) · head ([0-9a-f]{7,40})"
+                             r"(?:\s.*)?", re.I)
+PACKET_MARKER = "**Read these lines**"
+PACKET_READ_RE = re.compile(r"\*\*Read these lines\*\* \((?:(\d+) marked of )?(\d+)\)")
+CHECK_STATES = {"pass": "passed", "fail": "failing", "pending": "pending", "skipping": "skipped",
+                "cancel": "cancelled"}
+
+
+def packet_problems(text: str, state: dict[str, Any], report: dict[str, Any],
+                    pending: dict[str, Any] | None = None) -> list[str]:
+    """Compare the packet's title line and read marker (human-surfaces.md) with the ledger and the worktree.
+    `pending` is a budget override being recorded with this packet."""
+    problems = []
+    lines = text.lstrip("\ufeff").splitlines()
+    first = next((line.strip() for line in lines if line.strip()), "")
+    title = PACKET_TITLE_RE.fullmatch(first)
+    if not title:
+        problems.append("first line is not '## Review packet: <T0|T1|T2> · patch <id> · head <sha>'")
+    else:
+        tier, patch, head = title.group(1).lower(), title.group(2).lower(), title.group(3).lower()
+        if tier != state["tier"]:
+            problems.append(f"packet tier {tier.upper()} is not the run tier {state['tier'].upper()}")
+        if not report["head_sha"].startswith(head):
+            problems.append(f"packet head {head} is not the worktree HEAD {report['head_sha'][:12]}")
+        if not report["patch_id"].startswith(patch):
+            problems.append(f"packet patch {patch} is not the current patch-id {report['patch_id'][:12]}")
+    statuses, required = report["artifacts"], REQUIRED[state["tier"]]
+    for name in DEPENDENCIES["packet"]:
+        status = statuses[name]["status"]
+        if (name in required or status != "absent") and status != "current":
+            problems.append(f"{name} is {status}: {'; '.join(statuses[name]['reasons']) or 'not recorded'}")
+    markers, fenced = [], False
+    for line in lines:  # a quoted, indented or fenced marker is not it
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and line.startswith(PACKET_MARKER):
+            markers.append(line)
+    read = PACKET_READ_RE.match(markers[0]) if markers else None
+    counted = report["must_read_lines"]
+    if read:
+        marked, stated = (int(value) if value else None for value in read.groups())
+        if stated != counted:
+            problems.append(f"packet must-read {stated} is not the counted {counted}")
+        overrides = [pending] if pending else [item for item in state.get("budget_overrides", [])
+                                               if item.get("patch_id") == report["patch_id"]]
+        if marked is not None and not any((item["marked_lines"], item["must_read_lines"]) == (marked, stated)
+                                          for item in overrides):
+            problems.append(f"override not recorded: no budget override for this patch marks {marked} of {stated}")
+    elif markers:
+        problems.append(f"malformed marker {markers[0][:60]!r}: use '**Read these lines** (N)' with a plain integer")
+    elif state["tier"] == "t2":
+        problems.append("no '**Read these lines** (N)' line (T2)")
+    split = not read or read.group(1) is None
+    problems += [f"{gate['gate']}: {gate['detail']}" for gate in report["gates"]
+                 if "packet" in gate["blocks"] and (split or gate["gate"] != SPLIT_GATE)]
+    if not report["worktree_clean"]:
+        problems.append("worktree has uncommitted changes")
+    return problems
+
+
+def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str]) -> tuple[list[str], str]:
+    """Every required check passed (when none are named: no check pending, failing or cancelled). Returns
+    (problems, note); `checks: null` in the project config means the project has no CI."""
+    if not config["checks"]:
+        return [], "no CI (project config sets checks to null)"
+    used = set(PLACEHOLDER_RE.findall(config["checks"]))
+    bad = sorted(key for key in used if key not in values or not re.fullmatch(VALUE_RES[key], values[key]))
+    if bad:
+        raise WorkflowError(f"refusing to run checks: placeholders {', '.join(bad)} are unavailable or out of set")
+    argv = render(config["checks"], values)
+    try:  # `gh pr checks` exits non-zero while checks are pending or failing; its JSON still says which
+        proc = subprocess.run(argv, cwd=repo, capture_output=True, text=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"cannot run {shlex.join(argv)}: {exc}"], ""
+    output = proc.stdout.lstrip("\ufeff").strip()
+    try:
+        rows = json.loads(output) if output else []
+    except ValueError:
+        if "no checks reported" not in (proc.stdout + proc.stderr).lower():
+            return [f"cannot read checks from {shlex.join(argv)}: not JSON"], ""
+        rows = []
+    if not isinstance(rows, list) \
+            or not all(isinstance(row, dict) and {"name", "bucket"} <= row.keys() for row in rows):
+        return [f"cannot read checks from {shlex.join(argv)}: expected a list of {{name, bucket}}"], ""
+    if not rows:
+        return ["no checks reported; if the project has no CI, set checks to null in its config"], ""
+    required, buckets = config["required_checks"], [(str(row["name"]), str(row["bucket"]).lower()) for row in rows]
+    problems = [f"required check {name} has not reported" for name in required
+                if name not in {row for row, _ in buckets}]
+    for name, bucket in buckets:
+        if bucket not in CHECK_STATES:
+            problems.append(f"check {name} has an unknown state {bucket!r}")
+        elif name in required and bucket != "pass":
+            problems.append(f"required check {name} is {CHECK_STATES[bucket]}")
+        elif not required and bucket in ("fail", "pending", "cancel"):
+            problems.append(f"check {name} is {CHECK_STATES[bucket]}")
+    return problems, ""
+
+
+def pr_problems(repo: Path, project: str | None, pr: str, report: dict[str, Any]) -> tuple[list[str], str]:
+    """The PR head must be the local HEAD and its checks green; read-only commands only."""
+    config = project_config(repo, project, report["base_sha"])
+    values = {"pr": pr, "sha": report["head_sha"], "patch_id": report["patch_id"],
+              "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
+    used = {name for key in ("pr_head", "checks") if config[key] for name in PLACEHOLDER_RE.findall(config[key])}
+    bad = [f"{{{key}}}={values[key]!r}" for key in sorted(used & values.keys())
+           if not re.fullmatch(VALUE_RES[key], values[key])]
+    if bad or used - values.keys():
+        raise WorkflowError(f"refusing to run pr_head or checks: out-of-set values {', '.join(bad) or 'none'}; "
+                            f"unavailable placeholders {', '.join(sorted(used - values.keys())) or 'none'}")
+    problems = []
+    try:
+        if not config["pr_head"]:
+            raise WorkflowError("project config switches pr_head off; the PR head cannot be checked")
+        check_pr_head(repo, render(config["pr_head"], values), values["sha"])
+    except WorkflowError as exc:
+        problems.append(str(exc))
+    found, note = check_problems(repo, config, values)
+    return problems + found, note
+
+
+def read_packet(path: Path) -> tuple[bytes, str]:
+    try:
+        data = path.read_bytes()
+        return data, data.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkflowError(f"cannot read packet {path}: {exc}") from exc
+
+
+def cmd_packet_check(args: argparse.Namespace) -> int:
+    """Before posting a packet: its head, patch-id and must-read count must match the ledger and the worktree;
+    with --pr, the PR head too, and no required check may be pending or failing. Never posts or records."""
+    repo, _, state = open_run(args)
+    report = evaluate(state, repo)
+    problems, note = packet_problems(read_packet(Path(args.packet))[1], state, report), ""
+    if args.pr:
+        found, note = pr_problems(repo, args.project, args.pr, report)
+        problems += found
+    if problems:
+        raise WorkflowError("packet-check refused, do not post:\n- " + "\n- ".join(problems))
+    print(f"packet-check ok: head {report['head_sha'][:12]}, patch {report['patch_id'][:12]}, must-read "
+          f"{report['must_read_lines']}" + (f", PR {args.pr} head and checks" if args.pr else ", PR not checked")
+          + (f"; {note}" if note else ""))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     repo, _, state = open_run(args)
     report = evaluate(state, repo)
     if args.json:
         emit(report)
     else:
+        def print(line: str) -> None:  # ledger text (sources, reasons, names) may hold control characters
+            builtins.print(CONTROL_RE.sub(lambda match: f"\\x{ord(match.group()):02x}", line))
         print(f"run: {report['run']} (tier {report['tier']}); source: {report['source']}")
         if report["purpose"]:
             print(f"purpose: {report['purpose']}")
@@ -1086,17 +1397,24 @@ def cmd_status(args: argparse.Namespace) -> int:
               + ("; squash-merged, judged at the build snapshot" if report["squashed"] else ""))
         print(f"worktree: {'clean' if report['worktree_clean'] else 'dirty'}")
         print(f"rules: {report['rules_path'] or 'none'} (sha256 {report['rules_sha256'] or '-'})")
-        budget = report["must_read_budget"]
-        print(f"path floor: {report['path_floor'] or 'n/a'}; must-read lines: {report['must_read_lines']}"
-              + (f"/{budget}" if budget is not None else "")
-              + f" (+{report['must_read_added']}/-{report['must_read_deleted']})")
+        budget, excluded = report["must_read_budget"], report["must_read_excluded"]
+        print(f"path floor: {report['path_floor'] or 'n/a'}; budget: {budget if budget is not None else 'none'}")
+        print(f"must-read: {report['must_read_lines']} counted (+{report['must_read_added']}/"
+              f"-{report['must_read_deleted']}), {excluded['moved']} excluded (moved {excluded['moved']})"
+              + (f"; {report['must_read_note']}" if report["must_read_note"] else ""))
         for gate in report["gates"]:
             print(f"GATE {gate['gate']}: {gate['detail']}")
         for name in ARTIFACT_ORDER:
             item = report["artifacts"][name]
             detail = "; ".join(item["reasons"] + item["notes"])
             label = "" if item["required"] else " [optional]"
-            print(f"{name}{label}: {item['status']}" + (f" ({detail})" if detail else ""))
+            who = f" [recorded by {item['recorded_by'] or 'unnamed'} at {item['recorded_at']}]" \
+                if item.get("recorded_at") else ""
+            skipped = f" [packet-check skipped: {item['packet_check_skipped']}]" \
+                if item.get("packet_check_skipped") else ""
+            if name == "packet" and item.get("recorded_at") and not item.get("pr_checked"):
+                skipped += " [PR/CI not checked]"
+            print(f"{name}{label}: {item['status']}{who}{skipped}" + (f" ({detail})" if detail else ""))
         for carry in report["carries"]:
             print(f"carry r{carry['revision']}: patch {carry['from_patch_id'][:12]} -> {carry['patch_id'][:12]} at "
                   f"{carry['head_sha'][:12]}; only {', '.join(carry['changed_files']) or 'no files'} changed")
@@ -1197,6 +1515,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "budget when --budget-override-reason is given")
     record.add_argument("--budget-override-reason", help="packet: accept a split-required packet whose "
                         "--marked-lines fit the budget")
+    record.add_argument("--recorded-by", help="who records it: the subagent or person that produced the artifact, "
+                        "at the moment it finished (e.g. implementer, cold-reader)")
+    record.add_argument("--pr", help="packet: also check the PR head and required checks, as packet-check --pr")
+    record.add_argument("--project", help="packet: project config for --pr, as for approve")
+    record.add_argument("--skip-packet-check", metavar="REASON", help="packet: record although packet-check "
+                        "refuses; the reason and the refusals are stored and shown in status")
     record.add_argument("--remote-sha", help="published: pushed SHA (must equal HEAD), or the merge commit "
                         "once the branch is merged (its first-parent diff must match the approved patch)")
     record.set_defaults(handler=locked(cmd_record))
@@ -1215,7 +1539,17 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "approve":
             land.add_argument("--approver", required=True, help="name of the human who approved")
             land.add_argument("--evidence-url", help="the approval message or comment URL")
+            land.add_argument("--allow-skipped-packet-check", action="store_true", help="approve a packet recorded "
+                              "with --skip-packet-check; recorded in the approval")
         land.set_defaults(handler=handler)
+
+    packet_check = subparsers.add_parser("packet-check", help="before posting: match the packet's head, patch-id, "
+                                         "must-read count and (with --pr) PR head and checks to the ledger")
+    add_common(packet_check)
+    packet_check.add_argument("--packet", required=True, help="the packet file (grammar: human-surfaces.md)")
+    packet_check.add_argument("--pr", help="PR number (digits only): also check its head and required checks")
+    packet_check.add_argument("--project", help="project config, as for approve")
+    packet_check.set_defaults(handler=cmd_packet_check)
 
     status = subparsers.add_parser("status", help="evaluate missing and stale artifacts")
     add_common(status, rules=True)
