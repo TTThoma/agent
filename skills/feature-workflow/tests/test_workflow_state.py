@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -621,6 +623,9 @@ with log.open("a") as handle:
     handle.write(json.dumps(sys.argv[2:]) + "\\n")
 if command == "pr-head":
     print(pathlib.Path(sys.argv[3]).read_text().strip())
+if command == "move":  # a push lands while approve runs
+    pathlib.Path(sys.argv[3]).write_text(sys.argv[4])
+sys.exit(3 if command == "fail" else 0)
 """
 
 
@@ -686,13 +691,14 @@ class LandingTest(RepoCase):
         self.approved_run()
         report = self.status()
         self.assertEqual(report["artifacts"]["approval"]["status"], "current")
-        status, ready = self.calls()[1:]
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
+        ready, status = self.calls()[1], self.calls()[3]
         self.assertEqual(status[:4], ["status", self.head(), report["patch_id"], "Ann Lee"])  # one argv element
         self.assertEqual(ready, ["ready", "7"])
         approval = json.loads((self.state_dir / "state.json").read_text())["artifacts"]["approval"]
         self.assertEqual((approval["approver"], approval["patch_id"], approval["pr"]),
                          ("Ann Lee", report["patch_id"], "7"))
-        self.assertEqual([item["argv"][3] for item in approval["commands"]], ["status", "ready"])
+        self.assertEqual([item["argv"][3] for item in approval["commands"]], ["ready", "status"])
 
     def test_approve_refuses_head_mismatch(self) -> None:
         self.init("t2", "--rules", str(self.write_rules()))
@@ -733,11 +739,12 @@ class LandingTest(RepoCase):
         del self.project["mark_ready"]  # missing key: the default `gh pr ready {pr}`, printed, never run
         before = (self.state_dir / "state.json").read_text()
         result = self.land("approve", "--approver", "ann", "--dry-run", check=True)
-        plan = json.loads(result.stdout)
+        plan = json.loads(result.stdout)["would_run"]
         patch = self.status()["patch_id"]
-        self.assertEqual(plan["would_run"][1], ["gh", "pr", "ready", "7"])
-        self.assertEqual(plan["would_run"][0][2:6], [str(self.log), "status", self.head(), patch])
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head"])
+        self.assertEqual(plan["mark_ready"], ["gh", "pr", "ready", "7"])
+        self.assertEqual(plan["approval_status"][2:6], [str(self.log), "status", self.head(), patch])
+        self.assertEqual(plan["pr_head"][3], "pr-head")
+        self.assertEqual(self.calls(), [])  # not even the pr_head read
         self.assertEqual((self.state_dir / "state.json").read_text(), before)
 
     def test_carry_accepts_skip_read_change_after_rebase(self) -> None:
@@ -751,8 +758,9 @@ class LandingTest(RepoCase):
         result = self.land("carry")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(),
-                         f"carried approval for PR 7 to {self.head()}: only tests/fixtures/rows.json changed")
+                         f"carried approval for PR 7 to {self.head()}: only tests/fixtures/rows.json changed; this will merge")
         self.assertEqual(self.calls()[-1][:3], ["status", self.head(), self.status()["patch_id"]])
+        self.assertIn("carry r", self.workflow("status").stdout)
         report = self.status()
         for name in ("cold-read", "packet", "approval"):
             self.assertEqual(report["artifacts"][name]["status"], "current", name)
@@ -778,7 +786,7 @@ class LandingTest(RepoCase):
         self.publish_head()
         self.assertIn("notes.txt changed and not skip-read", self.land("carry").stderr)
         self.assertEqual(self.status()["artifacts"]["approval"]["status"], "stale")
-        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "status", "ready"])
+        self.assertEqual([call[0] for call in self.calls()], ["pr-head", "ready", "pr-head", "status"])
 
     def test_carry_after_identical_rebase_resets_status(self) -> None:
         self.approved_run()
@@ -829,15 +837,83 @@ class LandingTest(RepoCase):
             self.record(name)
         self.publish_head()
         option = self.workflow("approve", "--pr=--undo", "--approver", "ann", check=False)
-        self.assertIn("--pr must be a PR number or branch name", option.stderr)
+        self.assertIn("out-of-set values: {pr}='--undo'", option.stderr)
+        for approver in ("-x", "a;b", "$(id)"):
+            refused = self.workflow("approve", "--pr", "7", f"--approver={approver}", check=False)
+            self.assertIn("out-of-set values: {approver}", refused.stderr, approver)
         branch = self.workflow("approve", "--pr", "7", "--approver", "ann", "--dry-run", check=False)
-        self.assertIn("this patch changes", branch.stderr)
+        self.assertIn("this patch changes .feature-workflow/", branch.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_purpose_is_stored_and_shown(self) -> None:
         self.init("t2", "--purpose", "land bundle A")
         self.assertEqual(self.status()["purpose"], "land bundle A")
         self.assertIn("purpose: land bundle A", self.workflow("status").stdout)
+        resumed = self.workflow("init", "--source", "x", "--resume", "--purpose", "land bundles A and C")
+        self.assertIn("purpose updated: land bundles A and C", resumed.stderr)
+        self.assertEqual(self.status()["purpose"], "land bundles A and C")
+
+    def ready_for_approval(self) -> None:
+        self.init("t2", "--rules", str(self.write_rules()))
+        self.record("brief")
+        self.commit("core/engine.py", "route = 1\n", "core")
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+
+    def test_approve_stops_when_pr_head_moves_after_mark_ready(self) -> None:
+        self.ready_for_approval()
+        self.project["mark_ready"] = self.project["mark_ready"].replace(
+            "ready {pr}", f"move {shlex.quote(str(self.pr_head_file))} {'b' * 40}")
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("it moved after mark_ready; no approval status set", refused.stderr)
+        self.assertNotIn("status", [call[0] for call in self.calls()])
+        self.assertEqual(self.status()["artifacts"]["approval"]["status"], "absent")
+
+    def test_failed_approval_status_records_only_an_attempt(self) -> None:
+        self.ready_for_approval()
+        self.project["approval_status"] = self.project["approval_status"].replace(" status ", " fail ")
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("exited 3", refused.stderr)
+        self.assertIn("no approval recorded", refused.stderr)
+        state = json.loads((self.state_dir / "state.json").read_text())
+        self.assertNotIn("approval", state["artifacts"])
+        self.assertEqual(state["approval_attempts"][0]["failed_step"], "approval_status")
+
+    def test_approve_reevaluates_under_the_lock(self) -> None:
+        self.ready_for_approval()  # a concurrent writer invalidates the packet while mark_ready runs
+        self.project["mark_ready"] = " ".join(shlex.quote(part) for part in (
+            sys.executable, str(SCRIPT), "invalidate", "--repo", str(self.repo), "--slug", "account-export",
+            "--state-dir", str(self.state_dir), "--from", "packet", "--reason", "concurrent change"))
+        refused = self.land("approve", "--approver", "ann")
+        self.assertIn("cannot approve", refused.stderr)
+        self.assertIn("concurrent change", refused.stderr)
+        self.assertNotIn("status", [call[0] for call in self.calls()])
+
+    def test_ledger_writes_wait_for_the_lock(self) -> None:
+        self.init("t2")
+        with open(self.state_dir / "state.lock", "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            writer = subprocess.Popen([sys.executable, str(SCRIPT), "record", "--slug", "account-export",
+                                       "--state-dir", str(self.state_dir), "--artifact", "brief", "--path",
+                                       str(self.write_artifact("brief"))], cwd=self.repo,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(1.5)
+            self.assertIsNone(writer.poll())
+            self.assertEqual(self.status()["artifacts"]["brief"]["status"], "absent")
+        self.assertEqual(writer.wait(timeout=30), 0)
+        self.assertEqual(self.status()["artifacts"]["brief"]["status"], "current")
+
+    def test_closed_run_and_unrecorded_pr_refuse(self) -> None:
+        self.ready_for_approval()
+        self.record("approval")  # by hand: no PR recorded
+        self.assertIn("approve with --pr first", self.land("carry").stderr)
+        state_file = self.state_dir / "state.json"
+        state = json.loads(state_file.read_text())
+        state["artifacts"]["published"] = {"landing": "squash"}
+        state_file.write_text(json.dumps(state))
+        for command, extra in (("approve", ("--approver", "ann")), ("carry", ())):
+            self.assertIn("run is closed", self.land(command, *extra).stderr)
 
     def test_project_loader_defaults_and_validation(self) -> None:
         module = load_module()
@@ -849,11 +925,16 @@ class LandingTest(RepoCase):
                          (None, ["ci"], None))
         self.assertTrue(partial["pr_head"].endswith("{pr}"))
         for bad in ({"mark_ready": "gh pr ready {PR}"}, {"merge_mode": "auto"}, {"retriger": "x"},
-                    {"required_checks": "ci"}, {"approval_status": "  "}, {"pr_head": 'gh "x'}):
+                    {"required_checks": "ci"}, {"approval_status": "  "}, {"pr_head": 'gh "x'},
+                    {"approval_status": "bash -c 'gh api x'"}, {"mark_ready": "/bin/sh -ec 'gh pr ready {pr}'"}):
             with self.assertRaises(module.WorkflowError, msg=bad):
                 module.load_project(self.write_project(**bad))
         self.assertEqual(module.render("echo {approver} --jq '{a: .b}'", {"approver": "a b; rm"}),
                          ["echo", "a b; rm", "--jq", "{a: .b}"])
+        (self.repo / ".feature-workflow").mkdir()
+        (self.repo / ".feature-workflow" / "project.json").symlink_to(self.write_project())
+        with self.assertRaisesRegex(module.WorkflowError, "symlink"):
+            module.find_project(self.repo, None)
 
 
 if __name__ == "__main__":
