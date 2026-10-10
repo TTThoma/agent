@@ -15,7 +15,7 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 ## Stage notes
 
 ### shape
-- Each run records its own brief file. `record --artifact brief` keeps a snapshot per run, but never point several runs at one shared, mutable brief: the ledger warns when another open run recorded a brief from the same path. Evidence from a 2026 pilot: 46 of 48 runs shared one brief, and 42 of 48 recorded brief to packet within 3 minutes of the approval question.
+- Each run records its own brief file. `record --artifact brief` keeps a snapshot per run, but never point several runs at one shared, mutable brief: the ledger warns when another open run recorded a brief from the same path.
 - Input is a GitHub issue number or a few lines of idea. Restate it in ≤5 lines before asking anything.
 - **Round 1, scope:** goals, non-goals and who it is for. Ask ≤3 questions, each with a recommended answer.
 - **Round 2, facts:** run research in parallel subagents (vendor docs, pricing, **terms of service / resale**, repo precedent, a cheap live probe within a stated cap). Bring back only what changes a decision.
@@ -37,12 +37,12 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 ### cold-read
 - Spawn a new non-forked, read-only subagent. Give it only the repo root, base SHA and head SHA, plus `understand-pr`. Withhold the brief, spec, PR body and commit messages until its reconstruction is fixed. Then resume the same agent with the brief for the comparison.
 - If an isolated resumable agent is unavailable, disclose that independence is not guaranteed.
-- The cold reader records `cold-read --recorded-by cold-reader` when its comparison is written, not the orchestrator afterwards.
+- The cold reader is read-only, except that it records its own artifact: `record --artifact cold-read --recorded-by cold-reader` when its comparison is written, not the orchestrator afterwards.
 
 ### packet
 - Built from reviewer-map output, verification and cold-read. Use the template in `human-surfaces.md`.
 - For T2, "Read these lines" totals ≤ budget. If it does not fit, go back and split.
-- Run `packet-check --pr N` and post only when it passes (grammar in `human-surfaces.md`).
+- Record the packet with `record --artifact packet --pr N`, which runs `packet-check`, and post only the file it accepted (grammar in `human-surfaces.md`).
 
 ### approval
 - Ask one question. Record the approval with `approve --pr N --approver NAME`, which checks the PR head, sets the project's approval status and marks the PR ready (`landing.md`).

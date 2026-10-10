@@ -57,7 +57,7 @@ They read where the PR is. Post the packet as a PR comment and give them a ≤5-
 
 **Decisions in this PR** (log ids + any new agent decisions, one line each)
 
-**Read these lines** (N)    ← T2 only; N = counted must-read lines, ≤ budget
+**Read these lines** (N)
 | file:lines | why it matters | question to answer |
 
 **Found and fixed by adversarial review** (material only, one line each)
@@ -80,10 +80,10 @@ The reviewer-map skill output is the agent-internal input to "Read these lines".
 ### Packet grammar and `packet-check`
 
 Two lines are machine-checked; the rest is free text.
-- Line 1, exactly: `## Review packet: <T0|T1|T2> · patch <patch-id> · head <sha>`, with the run's tier and at least 7 hex characters of `status`'s patch-id and HEAD.
-- T2 only, a marker `**Read these lines** (N)`: N is `status`'s counted must-read lines. Under a budget override it is `(M marked of N)`, with M ≤ budget.
+- The title, the first non-blank line: `## Review packet: <T0|T1|T2> · patch <patch-id> · head <sha>`, with the run's tier and at least 7 hex characters of `status`'s patch-id and HEAD.
+- T2 only, a line starting `**Read these lines** (N)`: N is `status`'s counted must-read lines, a plain integer, and must fit the budget. A quoted or indented marker does not count. Over budget, the form is `(M marked of N)`, accepted only when the ledger already holds a budget override for this patch with the same M and N (`record --artifact packet --marked-lines M --budget-override-reason ...`).
 
-Before posting, run `workflow_state.py packet-check --slug S --packet FILE --pr N`. It refuses, listing every mismatch, when the head, patch-id, tier or count differs from the worktree and ledger, when verification or (T2) cold-read is not current, when the PR head is not the local HEAD, or when a check is pending or failing: each name in the project's `required_checks`, or every check when none are named, read through the `checks` template (`landing.md`). It never posts or records anything. Without `--pr` it skips the PR head and checks, so use it only for a draft. Evidence from a 2026 pilot: a packet posted before CI, a cap count that went 18→16→15 and a blank line count all reached the maintainer.
+`workflow_state.py packet-check --slug S --packet FILE --pr N` lists every mismatch and refuses when the tier, head, patch-id or count differs from the worktree and ledger, when verification or (T2) cold-read is not current, when the PR head is not the local HEAD, or when the checks are not green. Checks come from the project's `checks` template (`landing.md`): every name in `required_checks` must report `pass` (a skipped required check refuses); with none named, no check may be pending, failing or cancelled. An unknown state or no checks at all refuses, unless the project config sets `checks` to `null`, meaning it has no CI. It never posts or records anything. `record --artifact packet` runs the same check on its `--path` file (and the PR checks when given `--pr`), records the hash of the bytes it checked, and refuses unless `--skip-packet-check REASON` is given; the reason is stored and shown by `status`.
 
 ## Digest (orchestrator, once per attention burst)
 

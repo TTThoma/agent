@@ -62,6 +62,18 @@ class RepoCase(unittest.TestCase):
         path.write_text(f"# {name}\n", encoding="utf-8")
         return path
 
+    def write_packet(self, *extra: str) -> Path:
+        """A packet that passes packet-check for the current head, patch and count."""
+        report = json.loads(self.workflow("status", "--json", check=False).stdout)
+        count = str(report["must_read_lines"])
+        if "--marked-lines" in extra:
+            count = f"{extra[extra.index('--marked-lines') + 1]} marked of {count}"
+        path = self.state_dir / "packet.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"## Review packet: {report['tier'].upper()} · patch {report['patch_id'][:12]} · head "
+                        f"{report['head_sha'][:12]}\n\n**Read these lines** ({count})\n", encoding="utf-8")
+        return path
+
     def write_rules(self, **overrides: object) -> Path:
         path = self.state_dir / "tiers.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +82,9 @@ class RepoCase(unittest.TestCase):
 
     def record(self, name: str, *extra: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         arguments = ["--artifact", name]
-        if name in {"brief", "verification", "cold-read", "packet", "approval"}:
+        if name == "packet":
+            arguments.extend(["--path", str(self.write_packet(*extra))])
+        elif name in {"brief", "verification", "cold-read", "approval"}:
             arguments.extend(["--path", str(self.write_artifact(name))])
         if name == "approval" and not extra:
             extra = ("--approver", "maintainer")
@@ -1042,21 +1056,66 @@ class LandingTest(RepoCase):
         self.assertIn("is not the current patch-id", self.packet_check(stale).stderr)
         self.assertEqual(self.packet_check(self.packet()).returncode, 0)
 
-    def test_packet_check_refuses_wrong_or_blank_count(self) -> None:
+    def draft(self, text: str) -> Path:
+        path = self.state_dir / "packet-draft.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def title(self) -> str:
+        report = self.status()
+        return f"## Review packet: T2 · patch {report['patch_id'][:12]} · head {report['head_sha'][:12]}"
+
+    def test_packet_check_marker_grammar(self) -> None:
         self.packet_run()
         self.assertIn("packet must-read 3 is not the counted 2", self.packet_check(self.packet(count=3)).stderr)
-        self.assertIn("no '**Read these lines** (N)' marker", self.packet_check(self.packet(count="")).stderr)
-        self.assertEqual(self.packet_check(self.packet(count="0 marked of 2")).returncode, 0)
+        self.assertIn("malformed marker", self.packet_check(self.packet(count="")).stderr)
+        self.assertIn("malformed marker", self.packet_check(self.packet(count="2,")).stderr)
+        quoted = self.draft(f"{self.title()}\n> **Read these lines** (2)\n")
+        self.assertIn("no '**Read these lines** (N)' line", self.packet_check(quoted).stderr)
+        loose = self.draft(f"\ufeff\n\n{self.title()}\nmore text\n**Read these lines** (2) below\n")
+        self.assertEqual(self.packet_check(loose).returncode, 0, self.packet_check(loose).stderr)
 
-    def test_packet_check_refuses_pending_or_failing_checks(self) -> None:
+    def test_packet_check_needs_a_recorded_override(self) -> None:
+        self.packet_run()
+        unrecorded = self.packet_check(self.packet(count="1 marked of 2"))
+        self.assertIn("override not recorded", unrecorded.stderr)
+
+    def test_packet_check_states_of_checks(self) -> None:
         self.packet_run([{"name": "ci", "bucket": "pending"}, {"name": "lint", "bucket": "pass"}])
         self.assertIn("check ci is pending", self.packet_check(self.packet(), "--pr", "7").stderr)
-        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "fail"}]), encoding="utf-8")
-        self.assertIn("check lint is failing", self.packet_check(self.packet(), "--pr", "7").stderr)
-        self.project["required_checks"] = ["ci"]  # only named checks gate; ci has not reported yet
+        for rows, message in (([{"name": "lint", "bucket": "fail"}], "check lint is failing"),
+                              ([{"name": "lint", "bucket": "weird"}], "unknown state 'weird'"),
+                              ([], "no checks reported")):
+            self.checks_file.write_text(json.dumps(rows), encoding="utf-8")
+            self.assertIn(message, self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.checks_file.write_text("no checks reported on the 'feature' branch", encoding="utf-8")
+        self.assertIn("no checks reported;", self.packet_check(self.packet(), "--pr", "7").stderr)
+        self.checks_file.write_text(json.dumps([{"name": "lint", "bucket": "skipping"}]), encoding="utf-8")
+        self.assertEqual(self.packet_check(self.packet(), "--pr", "7").returncode, 0)  # skipped, not required
+        self.project["required_checks"] = ["ci", "lint"]
         result = self.packet_check(self.packet(), "--pr", "7")
         self.assertIn("required check ci has not reported", result.stderr)
-        self.assertNotIn("lint", result.stderr)
+        self.assertIn("required check lint is skipped", result.stderr)
+        self.project["checks"] = None  # the project has no CI
+        no_ci = self.packet_check(self.packet(), "--pr", "7")
+        self.assertEqual(no_ci.returncode, 0, no_ci.stderr)
+        self.assertIn("no CI", no_ci.stdout)
+
+    def test_record_packet_runs_packet_check(self) -> None:
+        self.packet_run([{"name": "ci", "bucket": "pending"}])
+        wrong = self.packet(head="0123456789ab")
+        args = ("record", "--artifact", "packet", "--path", str(wrong))
+        self.assertIn("packet-check refused", self.workflow(*args, check=False).stderr)
+        pending = ("record", "--artifact", "packet", "--path", str(self.packet()), "--pr", "7", "--project",
+                   str(self.write_project()))
+        self.assertIn("check ci is pending", self.workflow(*pending, check=False).stderr)
+        self.packet(head="0123456789ab")
+        self.workflow(*args, "--skip-packet-check", "head typo, fixed in the posted comment")
+        packet = self.status()["artifacts"]["packet"]
+        self.assertEqual(packet["packet_check_skipped"], "head typo, fixed in the posted comment")
+        self.assertIn("[packet-check skipped: head typo", self.workflow("status").stdout)
+        self.assertIn("apply only to the packet", self.record("approval", "--approver", "ann", "--pr", "7",
+                                                              check=False).stderr)
 
     def test_packet_check_refuses_before_cold_read(self) -> None:
         self.init("t2", "--rules", str(self.write_rules()))
@@ -1068,57 +1127,88 @@ class LandingTest(RepoCase):
 
 
 BLOCK = "".join(f"def helper_{i}(value):\n    return compute_total(value) + {i}\n\n\n" for i in range(4))
+BODY = "".join(f"    total = total + compute_value(item, {i})\n" for i in range(6))
 
 
 class MustReadTest(RepoCase):
-    """Moved and whitespace-only lines are excluded from must-read; changed lines never are."""
+    """Only blocks of >= 5 lines moved unchanged between must-read files are excluded; nothing else."""
 
     def classify(self) -> dict:
         return json.loads(self.workflow("classify").stdout)
 
-    def test_block_moved_between_must_read_files_is_excluded(self) -> None:
+    def change(self, base: dict[str, str], head: dict[str, str]) -> dict:
         self.commit_base_rules()
-        self.commit("core/fetch.py", "import os\n\n\n" + BLOCK, "base")
-        self.commit("core/common.py", "import sys\n", "base")
+        for name, text in base.items():
+            self.commit(name, text, "base")
         self.advance_base()
         self.init("t2")
-        self.commit("core/fetch.py", "import os\n", "move out")
-        self.commit("core/common.py", "import sys\n\n\n" + BLOCK + "def added():\n    return 1\n", "move in")
-        result = self.classify()
-        raw = sum(item["added"] + item["deleted"] for item in result["files"])
-        self.assertEqual(raw, 38)
-        self.assertEqual(result["must_read_excluded"], {"moved": 35, "whitespace": 0, "format": 0})
-        self.assertEqual(result["must_read_lines"], 3)  # the two new lines and one anchor where the block landed
+        for name, text in head.items():
+            if text is None:
+                self.exec_cmd("git", "rm", "-q", name)
+                self.exec_cmd("git", "commit", "-qm", "remove")
+            else:
+                self.commit(name, text, "head")
+        return self.classify()
+
+    def test_block_moved_between_must_read_files_is_excluded(self) -> None:
+        result = self.change({"core/fetch.py": "import os\n\n\n" + BLOCK, "core/common.py": "import sys\n"},
+                             {"core/fetch.py": "import os\n",
+                              "core/common.py": "import sys\n\n\n" + BLOCK + "def added():\n    return 1\n"})
+        self.assertEqual(sum(item["added"] + item["deleted"] for item in result["files"]), 38)
+        self.assertEqual(result["must_read_excluded"], {"moved": 34})
+        self.assertEqual(result["must_read_lines"], 4)  # an anchor where it left, one where it landed, 2 new lines
 
     def test_line_edited_inside_a_moved_block_still_counts(self) -> None:
-        self.commit_base_rules()
-        self.commit("core/fetch.py", BLOCK, "base")
-        self.advance_base()
-        self.init("t2")
-        self.commit("core/fetch.py", "", "move out")
-        self.commit("core/common.py", BLOCK.replace("+ 2\n", "+ 20\n"), "move in, edited")
+        self.change({"core/fetch.py": BLOCK}, {"core/fetch.py": "", "core/common.py": BLOCK.replace("+ 2\n", "+ 20\n")})
         module = load_module()
         base = self.exec_cmd("git", "rev-parse", "origin/main").stdout.strip()
-        lines = [line for section in module.moved_sections(self.repo, base, self.head(), [])
-                 for block in section for line in block]
-        edited = [line for line in lines if b"compute_total(value) + 2" in line[3]]
-        self.assertEqual(sorted((sign, moved) for sign, moved, _, _ in edited), [(b"+", False), (b"-", False)])
-        self.assertGreaterEqual(self.classify()["must_read_lines"], 2)
+        lines = [line for section in module.moved_sections(self.repo, base, self.head(), []) for line in section]
+        edited = [(sign, code in module.MOVED_CODES) for sign, code, text in lines if b"(value) + 2" in text]
+        self.assertEqual(sorted(edited), [(b"+", False), (b"-", False)])
+        self.assertGreaterEqual(self.classify()["must_read_lines"], 4)
+
+    def test_short_move_counts_on_both_sides(self) -> None:
+        view = "def view(request):\n    require_admin_permission(request)\n    return render(request)\n"
+        result = self.change({"core/a.py": view, "core/b.py": "def helper():\n    return 1\n"},
+                             {"core/a.py": view.replace("    require_admin_permission(request)\n", ""),
+                              "core/b.py": "def helper():\n    require_admin_permission(request)\n    return 1\n"})
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (2, 0))
+
+    def test_four_line_move_counts_on_both_sides(self) -> None:
+        checks = "".join(f"    require_permission_number_{i}(request)\n" for i in range(4))
+        result = self.change({"core/a.py": "def view(request):\n" + checks + "    return 1\n", "core/b.py": "x = 1\n"},
+                             {"core/a.py": "def view(request):\n    return 1\n", "core/b.py": "x = 1\n" + checks})
+        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (8, 0))
+
+    def test_move_within_one_file_counts_in_full(self) -> None:
+        parts = BLOCK.split("\n\n\n")[:4]
+        reordered = "\n\n\n".join(parts[2:] + parts[:2]) + "\n\n\n"
+        result = self.change({"core/order.py": BLOCK}, {"core/order.py": reordered})
+        self.assertEqual(result["must_read_excluded"]["moved"], 0)
+
+    def test_dedent_and_unwrap_count_in_full(self) -> None:
+        loop = "def run(items):\n    total = 0\n    for item in items:\n" \
+            + "    " + BODY.replace("\n    ", "\n        ")
+        flat = "def step(item, total):\n" + BODY
+        yaml_old = "jobs:\n  test:\n    steps:\n" + "".join(f"      - run: make target-number-{i}\n" for i in range(6))
+        yaml_new = "steps:\n" + "".join(f"  - run: make target-number-{i}\n" for i in range(6))
+        unwrap_old = "def guard(user):\n    if user.is_admin:\n" + BODY.replace("    ", "        ")
+        unwrap_new = "def guard(user):\n" + BODY
+        result = self.change({"core/loop.py": loop, "core/ci.yml": yaml_old, "core/guard.py": unwrap_old},
+                             {"core/loop.py": "def run(items):\n    total = 0\n", "core/step.py": flat,
+                              "core/ci.yml": None, "core/steps.yml": yaml_new, "core/guard.py": unwrap_new})
+        self.assertEqual(result["must_read_excluded"]["moved"], 0)  # every re-indented line is a changed line
+        self.assertEqual(result["must_read_lines"], sum(item["added"] + item["deleted"] for item in result["files"]))
 
     def test_block_moved_from_a_skip_read_file_counts_in_full(self) -> None:
-        self.commit_base_rules()
-        self.commit("tests/fixtures/helpers.py", BLOCK, "fixture")
-        self.advance_base()
-        self.init("t2")
-        self.exec_cmd("git", "rm", "-q", "tests/fixtures/helpers.py")
-        self.commit("core/helpers.py", BLOCK, "promote by copy")
-        result = self.classify()
+        result = self.change({"tests/fixtures/helpers.py": BLOCK},
+                             {"tests/fixtures/helpers.py": None, "core/helpers.py": BLOCK})
         self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (16, 0))
 
-    def test_unchanged_rename_is_a_move_only_from_an_equal_or_stricter_tier(self) -> None:
+    def test_unchanged_rename_into_must_read_counts_in_full(self) -> None:
         rules = RULES | {"rules": RULES["rules"] + [{"glob": "vendor/**", "tier": "t2", "skip_read": True}]}
         self.commit_base_rules(**rules)
-        self.commit("vendor/lib.py", BLOCK, "t2 source")
+        self.commit("vendor/lib.py", BLOCK, "t2 skip-read source")
         self.commit("docs/lib.py", BLOCK, "t1 source")
         self.advance_base()
         self.init("t2")
@@ -1127,45 +1217,21 @@ class MustReadTest(RepoCase):
         self.exec_cmd("git", "mv", "docs/lib.py", "core/doc_lib.py")
         self.exec_cmd("git", "commit", "-m", "renames")
         files = {item["path"]: item for item in self.classify()["files"]}
-        self.assertEqual((files["core/lib.py"]["must_read"], files["core/lib.py"]["excluded"]["moved"]), (0, 16))
-        self.assertEqual((files["core/doc_lib.py"]["must_read"], files["core/doc_lib.py"]["whole_file"]), (16, True))
-        self.commit("core/lib.py", BLOCK.replace("+ 1\n", "+ 10\n"), "edit after rename")
-        files = {item["path"]: item for item in self.classify()["files"]}
-        self.assertTrue(files["core/lib.py"]["whole_file"])  # any content change: not a pure move
-        self.assertEqual(files["core/lib.py"]["must_read"], 17)  # the whole new file and the changed old line
+        for name in ("core/lib.py", "core/doc_lib.py"):  # skip-read ranks below must-read t2
+            self.assertEqual((files[name]["must_read"], files[name]["whole_file"]), (16, True), name)
 
-    def test_whitespace_only_blocks_are_excluded_but_indentation_counts(self) -> None:
-        self.commit_base_rules()
-        self.commit("core/w.py", "a = 1\nb = 2\nif ready:\n    c = 3\nd = 'x y'\n", "base")
-        self.advance_base()
-        self.init("t2")
-        self.commit("core/w.py", "a = 1   \n\nb = 2\nif ready:\nc = 3\nd = 'x  y'\n", "whitespace")
-        result = self.classify()
-        self.assertEqual(result["must_read_excluded"]["whitespace"], 3)  # trailing space and a blank line
-        self.assertEqual(result["must_read_lines"], 4)  # the dedent and the string literal are changes
-
-    def test_formatter_from_out_of_tree_rules_only(self) -> None:
-        strip = shlex.quote("import sys; sys.stdout.write(sys.stdin.read().replace(chr(32), str()))")
-        formatter = {"command": f"{shlex.quote(sys.executable)} -c {strip} {{path}}", "globs": ["core/**"]}
-        self.commit("core/f.py", "x = 1\ny = 2\n", "base")
-        self.advance_base()
-        self.init("t2", "--rules", str(self.write_rules(formatter=formatter)))
-        self.commit("core/f.py", "x=1\ny =  2\nz = 3\n", "format and add")
+    def test_status_shows_counts_and_who_recorded(self) -> None:
+        self.change({"core/f.py": "x = 1\n"}, {"core/f.py": "x = 2\n"})
         self.workflow("record", "--artifact", "brief", "--path", str(self.write_artifact("brief")))
+        bad = self.workflow("record", "--artifact", "build", "--recorded-by", "impl ementer", check=False)
+        self.assertIn("--recorded-by must match", bad.stderr)
         self.workflow("record", "--artifact", "build", "--recorded-by", "implementer")
-        result = self.classify()
-        self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["format"]), (1, 4))
-        text = self.workflow("status").stdout
-        self.assertIn("must-read: 1 counted (+1/-0), 4 excluded (moved 0, whitespace 0, format 4)", text)
-        self.assertRegex(text, r"build: current \[recorded by implementer at 20")
-        self.assertEqual(self.status()["artifacts"]["build"]["recorded_by"], "implementer")
-        in_tree = RULES | {"formatter": formatter}
-        self.commit(".feature-workflow/tiers.json", json.dumps(in_tree), "in-tree rules")
-        module = load_module()
-        rules, _ = module.load_rules(self.repo / ".feature-workflow" / "tiers.json")
-        self.assertFalse(module.formatter_allowed(self.repo, rules))  # the branch controls it: never run
-        with self.assertRaises(module.WorkflowError):
-            module.load_rules(self.write_rules(formatter={"command": "fmt -", "globs": ["**"]}))
+        self.workflow("invalidate", "--from", "build", "--reason", "bell\x07 and\x1b[31m colour")
+        text = self.workflow("status", check=False).stdout
+        self.assertIn("must-read: 2 counted (+1/-1), 0 excluded (moved 0)", text)
+        self.assertRegex(text, r"build: stale \[recorded by implementer at 20")
+        self.assertIn("bell\\x07 and\\x1b[31m colour", text)
+        self.assertNotIn("\x1b", text)
 
     def test_shared_brief_warns_other_open_run(self) -> None:
         shared = self.repo.parent / f"{self.repo.name}-brief.md"
