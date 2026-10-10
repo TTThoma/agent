@@ -540,10 +540,13 @@ def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | N
                 "added": 0 if binary else int(added), "deleted": 0 if binary else int(deleted)}
         # A rename is judged by both paths: the higher tier, and skipped only if both paths skip.
         tier, skip = path_tier(rules, path)
-        old_counts = False
+        old_counts = unchanged_move = False
         if old_path:
             old_tier, old_skip = path_tier(rules, old_path)
             old_counts = old_tier == "t2" and not old_skip
+            # A 100%-similar rename from a tier at least as strict is a move; into a stricter tier it is new.
+            unchanged_move = not binary and item["added"] == item["deleted"] == 0 \
+                and TIERS.index(old_tier) >= TIERS.index(tier)
             if TIERS.index(old_tier) > TIERS.index(tier):
                 tier = old_tier
             skip = skip and old_skip
@@ -551,7 +554,7 @@ def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | N
             floor = tier
         counts = tier == "t2" and not skip
         read_added, read_deleted = (item["added"], item["deleted"]) if counts else (0, 0)
-        whole = counts and (binary or (bool(old_path) and not old_counts))
+        whole = counts and (binary or (bool(old_path) and not old_counts and not unchanged_move))
         if counts and binary:  # unreadable as a diff: the whole old and new content is must-read
             read_added = blob_lines(repo, head_sha, path)
             read_deleted = blob_lines(repo, base_sha, old_path or path)
@@ -560,6 +563,8 @@ def classify(repo: Path, base_sha: str, head_sha: str, rules: dict[str, Any] | N
         files.append({**item, "binary": binary, "tier": tier, "skip_read": skip, "whole_file": whole,
                       "must_read": read_added + read_deleted, "read_added": read_added, "read_deleted": read_deleted,
                       "excluded": dict.fromkeys(EXCLUSIONS, 0)})
+        if counts and unchanged_move and not old_counts:
+            files[-1]["excluded"]["moved"] = blob_lines(repo, head_sha, path)
     note = exclude(repo, base_sha, head_sha, files, rules)
     excluded = {key: sum(item["excluded"][key] for item in files) for key in EXCLUSIONS}
     added_total = sum(item.pop("read_added") for item in files)

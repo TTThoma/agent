@@ -1115,6 +1115,25 @@ class MustReadTest(RepoCase):
         result = self.classify()
         self.assertEqual((result["must_read_lines"], result["must_read_excluded"]["moved"]), (16, 0))
 
+    def test_unchanged_rename_is_a_move_only_from_an_equal_or_stricter_tier(self) -> None:
+        rules = RULES | {"rules": RULES["rules"] + [{"glob": "vendor/**", "tier": "t2", "skip_read": True}]}
+        self.commit_base_rules(**rules)
+        self.commit("vendor/lib.py", BLOCK, "t2 source")
+        self.commit("docs/lib.py", BLOCK, "t1 source")
+        self.advance_base()
+        self.init("t2")
+        (self.repo / "core").mkdir()
+        self.exec_cmd("git", "mv", "vendor/lib.py", "core/lib.py")
+        self.exec_cmd("git", "mv", "docs/lib.py", "core/doc_lib.py")
+        self.exec_cmd("git", "commit", "-m", "renames")
+        files = {item["path"]: item for item in self.classify()["files"]}
+        self.assertEqual((files["core/lib.py"]["must_read"], files["core/lib.py"]["excluded"]["moved"]), (0, 16))
+        self.assertEqual((files["core/doc_lib.py"]["must_read"], files["core/doc_lib.py"]["whole_file"]), (16, True))
+        self.commit("core/lib.py", BLOCK.replace("+ 1\n", "+ 10\n"), "edit after rename")
+        files = {item["path"]: item for item in self.classify()["files"]}
+        self.assertTrue(files["core/lib.py"]["whole_file"])  # any content change: not a pure move
+        self.assertEqual(files["core/lib.py"]["must_read"], 17)  # the whole new file and the changed old line
+
     def test_whitespace_only_blocks_are_excluded_but_indentation_counts(self) -> None:
         self.commit_base_rules()
         self.commit("core/w.py", "a = 1\nb = 2\nif ready:\n    c = 3\nd = 'x y'\n", "base")
