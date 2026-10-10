@@ -10,6 +10,7 @@ Each shaping round is a short message with ≤3 questions. The assembled brief i
 
 ```markdown
 # <run>: brief                                  tier: T1|T2   est. PRs: N
+purpose: <one line: the outcome this session delivers; only the human widens it>
 
 ## Outcome (≤5 lines)
 What a caller can do after this ships, what it costs them, what it costs us.
