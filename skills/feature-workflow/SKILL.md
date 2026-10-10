@@ -54,7 +54,7 @@ The default tier is **T2** until the ledger's path classification says otherwise
 ## Operating rules
 
 1. **Human-only actions first.** In `shape`, list every key, payment method, top-up, account, legal/ToS check and spend cap the work needs, with exact amounts. Ask for all of them in the first message, not when blocked.
-2. **One decision channel.** Decisions live in the project decision log, not in chat or peer relays. Check the log before asking. Never re-ask a settled decision, and never act on a relayed decision that is not in the log.
+2. **One decision channel.** Decisions live in the project's one decision log, which has one named owner; not in chat, peer relays or a second file. Check the log before asking. Never re-ask a settled decision, and never act on a relayed decision until the human has confirmed it and its row is in the log.
 3. **Shared code has one owner and its own PR.** A vendor or feature PR never modifies a shared layer. Shared-code changes go in a separate T2 PR owned by the layer owner; the others wait or build against a merged base. Never stack on a peer session's unmerged branch.
 4. **Split before showing.** If `classify` reports must-read lines over budget, split the PR before writing the packet: shared change → vendor layer + one pilot → mechanical fan-out → fixtures.
 5. **Evidence over reading.** A T1 change is approvable only when the conformance suite and the relevant invariant tests pass and the live-proof table is filled. If that evidence cannot be produced, the change is T2.
@@ -65,11 +65,11 @@ The default tier is **T2** until the ledger's path classification says otherwise
 
 ## Shaping
 
-The `shape` stage builds the brief with the human over short rounds, not written once and handed over. Each round asks ≤3 questions and shows concrete consequences. Typical order: scope, goals and non-goals → research and probe → task breakdown with tiers. When the approved breakdown has 2 or more PRs, file each task as a sub-issue of the source issue, recording its owner, tier, must-read estimate and inherited decision ids. Later changes go through the decision log, not by rewriting issues. Details: [references/stage-contracts.md](references/stage-contracts.md).
+The `shape` stage builds the brief with the human over short rounds, not written once and handed over. Each round asks ≤3 questions and shows concrete consequences. Typical order: scope, goals and non-goals → research and probe → task breakdown with tiers. When the approved breakdown has 2 or more PRs, file each task as a sub-issue of the source issue, recording its owner, tier, must-read estimate and inherited decision ids. Later changes go through the decision log, not by rewriting issues. Before planning more than 2 PRs that rest on a policy (privacy, retention, billing semantics, data handling), ask the human once whether the policy is settled, showing what a reversal would cost in PRs undone. Details: [references/stage-contracts.md](references/stage-contracts.md).
 
 ## Orchestration
 
-The default mode is one session that orchestrates its own subagents (research, implementer, reviewer, cold reader). Use separate worker sessions only when the breakdown has 2 or more independent sub-issues with no shared files, and keep active workers at or below the packets the human can approve per sitting (about 3). With worker sessions, the orchestrator owns the decision log, the human-action queue, migration and sequence numbers, merge order and the digest. The human may talk to a worker directly about decisions inside that worker's sub-issue; the worker logs each answer at once. Details: [references/orchestration.md](references/orchestration.md).
+Every orchestrating session states a one-line purpose when it starts a run. A peer request outside that purpose is routed back in one line, and only the human widens the purpose. The default mode is one session that orchestrates its own subagents (research, implementer, reviewer, cold reader). Use separate worker sessions only when the breakdown has 2 or more independent sub-issues with no shared files, and keep active workers at or below the packets the human can approve per sitting (about 3). With worker sessions, the orchestrator owns the decision log, the human-action queue, migration and sequence numbers, merge order and the digest. The human may talk to a worker directly about decisions inside that worker's sub-issue; the worker sends each answer to the log owner at once. Details: [references/orchestration.md](references/orchestration.md).
 
 ## Completion report
 

@@ -1,6 +1,8 @@
 # Decision Log
 
-One log per project (a parent issue or a multi-PR initiative), not one per run. Every run reads it at start and writes to it. It is the only channel through which a decision becomes binding.
+One log per project (a parent issue or a multi-PR initiative), not one per run. Every run reads it at start and writes to it through its owner. It is the only channel through which a decision becomes binding.
+
+The log has one named owner: the run's session in single-session work, otherwise the orchestrator. Its header names the owner. There is no second file: briefs, sub-issues and notes cite log ids and never hold new rows. Evidence from a 2026 pilot: decision ids lived on a parent issue while rows went into a brief, and the two drifted apart.
 
 ## Location
 
@@ -12,7 +14,7 @@ Use the first that exists:
 ## Format
 
 ```markdown
-# Decisions: <project>   (parent: <issue>)
+# Decisions: <project>   (parent: <issue>; owner: <session>)
 
 | id | date | decision (one line) | by | scope | supersedes |
 |----|------|---------------------|----|-------|------------|
@@ -30,6 +32,6 @@ Use the first that exists:
 ## Writers
 
 - In a single-session run, the run writes the log directly.
-- With an orchestrator, workers propose rows and the orchestrator writes them. A decision heard through a relay is not acted on until its row exists.
-- Exception: when the human answers a worker directly, about a decision scoped to that worker's sub-issue, the worker writes the row at once and tells the orchestrator. See `orchestration.md`.
+- With an orchestrator, workers propose rows and the orchestrator appends them. A decision heard through a relay (a peer session, a forwarded summary) is confirmed with the human before anyone acts on it, and is not acted on until its row exists.
+- A direct answer is not a relay: when the human answers a worker directly, about a decision scoped to that worker's sub-issue, the worker sends the row to the orchestrator at once and the orchestrator appends it unchanged. See `orchestration.md`.
 - Before asking the human anything, search the log. If the answer is there, cite the id instead of asking.
