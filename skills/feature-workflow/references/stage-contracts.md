@@ -45,7 +45,7 @@ Execute the first required stage (for the run's tier) that is absent or stale. A
 - Record the packet with `record --artifact packet --pr N`, which runs `packet-check`, and post only the file it accepted (grammar in `human-surfaces.md`).
 
 ### approval
-- Ask one question; T0 and T1 packets may share a batch question (`human-surfaces.md`). Record each approval with `approve --pr N --approver NAME --expect-patch ID`, which checks the patch, CI, the PR head, sets the project's approval status and marks the PR ready (`landing.md`).
+- Ask one question; T0 and T1 packets may share a batch question (`human-surfaces.md`). Record each approval with `approve --pr N --approver NAME --expect-patch ID`, which checks the patch, CI, the PR head, sets the project's approval status and marks the PR ready, or under `ready_at_packet` checks that the packet step already did (`landing.md`).
 - A requested change returns to `build`. The ledger invalidates packet and approval when the patch changes.
 
 ### published

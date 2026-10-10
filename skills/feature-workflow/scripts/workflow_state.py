@@ -63,8 +63,10 @@ PROJECT_DEFAULTS: dict[str, Any] = {
     "required_checks": [],
     "merge_mode": None,
     "checks": "gh pr checks {pr} --json name,bucket",
+    "pr_draft": "gh pr view {pr} --json isDraft -q .isDraft",
+    "ready_at_packet": False,
 }
-TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger", "checks")
+TEMPLATE_KEYS = ("approval_status", "mark_ready", "pr_head", "retrigger", "checks", "pr_draft")
 MERGE_MODES = ("bot", "manual")
 PLACEHOLDERS = ("pr", "sha", "patch_id", "approver", "date", "head_ref")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
@@ -330,7 +332,15 @@ def load_project(path: Path | str | None, text: str | None = None) -> dict[str, 
         raise WorkflowError(f"invalid project config {path}: required_checks must be a list of names")
     if mode is not None and mode not in MERGE_MODES:
         raise WorkflowError(f"invalid project config {path}: merge_mode must be one of {', '.join(MERGE_MODES)}")
-    config.update({"required_checks": checks, "merge_mode": mode})
+    ready_at_packet = data.get("ready_at_packet", False)
+    if not isinstance(ready_at_packet, bool):
+        raise WorkflowError(f"invalid project config {path}: ready_at_packet must be true or false")
+    if ready_at_packet and not (config["mark_ready"] and config["pr_draft"] and config["approval_status"]
+                                and checks):
+        raise WorkflowError(f"invalid project config {path}: ready_at_packet needs mark_ready, pr_draft, an "
+                            "approval_status the merge mechanism waits for, and required_checks naming the check "
+                            "that runs only on a ready PR")
+    config.update({"required_checks": checks, "merge_mode": mode, "ready_at_packet": ready_at_packet})
     return config
 
 
@@ -986,14 +996,22 @@ def cmd_record(args: argparse.Namespace) -> int:
     if artifact == "packet":  # the packet-check gate; the hash is of the bytes that were checked
         data, text = read_packet(Path(resolved_path or ""))
         problems = packet_problems(text, state, report, override)
-        found, note = pr_problems(repo, args.project, args.pr, report) if args.pr else ([], "")
+        found, note, context = packet_pr_problems(repo, args.project, args.pr, report, record=True) \
+            if args.pr else ([], "", {})
         problems += found
         if problems and not (args.skip_packet_check or "").strip():
             raise WorkflowError("cannot record packet; packet-check refused (or pass --skip-packet-check REASON):"
                                 "\n- " + "\n- ".join(problems))
+        ready = None
+        if context and context["config"]["ready_at_packet"]:
+            if problems:
+                print("not marked ready: packet-check was skipped; approve refuses while the PR is a draft",
+                      file=sys.stderr)
+            else:
+                ready = ready_at_packet(repo, context)
         extra.update({"sha256": hashlib.sha256(data).hexdigest(), "packet_check": {
             "pr": args.pr, "note": note or None, "skipped": args.skip_packet_check if problems else None,
-            "overridden": problems}})
+            "overridden": problems, "unreported_required": context.get("unreported")}, "ready_marked": ready})
     if source:
         warn_shared_brief(repo, path, source)
     if artifact == "approval":
@@ -1197,7 +1215,7 @@ def landing_plan(repo: Path, args: argparse.Namespace, report: dict[str, Any], a
         raise WorkflowError(f"refusing to run commands with out-of-set values: {', '.join(bad)}")
     steps = {key: render(config[key], values) for key in ("pr_head", *keys) if config[key]}
     landing = {"project_config": config["path"], "merge_mode": config["merge_mode"],
-               "required_checks": config["required_checks"]}
+               "required_checks": config["required_checks"], "ready_at_packet": config["ready_at_packet"]}
     if args.dry_run:
         emit({"dry_run": True, **landing, "would_run": steps})
         return None
@@ -1230,12 +1248,14 @@ def recheck(repo: Path, path: Path, artifact: str, values: dict[str, str],
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    """mark_ready, re-check the PR head, then approval_status and the record, under the ledger lock."""
+    """mark_ready (or, under ready_at_packet, check the PR is out of draft), re-check the PR head, then
+    approval_status and the record, under the ledger lock."""
     repo, path, state = open_run(args)
     refuse_closed(state)
     report = evaluate(state, repo)
     require_current(report, state, "approval")
-    grant = grant_request(args, project_config(repo, args.project, report["base_sha"]))
+    config = project_config(repo, args.project, report["base_sha"])
+    grant = grant_request(args, config)
     approver = delegated_approver() if grant else args.approver
     if not approver:
         raise WorkflowError("approve needs --approver NAME, or --grant for a delegated approval")
@@ -1255,16 +1275,27 @@ def cmd_approve(args: argparse.Namespace) -> int:
             raise WorkflowError(f"a delegated approval covers at most {DELEGATION_MAX_LINES} changed lines in all; "
                                 f"this patch changes {total}: it waits for the human")
         pin_grant(repo, grant, write=not args.dry_run)
-    plan = landing_plan(repo, args, report, approver, ("mark_ready", "approval_status"))
+    ready_early = config["ready_at_packet"]  # record --artifact packet --pr marked it ready
+    plan = landing_plan(repo, args, report, approver,
+                        ("pr_draft" if ready_early else "mark_ready", "approval_status"))
     if plan is None:
         return 0
     values, steps, landing = plan
     check_pr_head(repo, steps["pr_head"], values["sha"])
+    done = []
+    if ready_early:
+        draft, read = draft_state(repo, steps["pr_draft"])
+        if draft:
+            raise WorkflowError(f"PR {args.pr} is a draft; under ready_at_packet, record --artifact packet --pr "
+                                f"{args.pr} marks it ready once the packet check passes")
+        done.append(read)
     ci, ci_note = check_problems(repo, project_config(repo, args.project, report["base_sha"]), values)
     if ci:
         raise WorkflowError("cannot approve before CI is green: " + "; ".join(ci))
-    done = [run_command(repo, steps["mark_ready"])] if "mark_ready" in steps else []
-    check_pr_head(repo, steps["pr_head"], values["sha"], "it moved after mark_ready; no approval status set")
+    if not ready_early and "mark_ready" in steps:
+        done.append(run_command(repo, steps["mark_ready"]))
+    check_pr_head(repo, steps["pr_head"], values["sha"], "it moved during approve; no approval status set"
+                  if ready_early else "it moved after mark_ready; no approval status set")
     with ledger_lock(path):
         state, report = recheck(repo, path, "approval", values)
         try:
@@ -1439,9 +1470,12 @@ def packet_problems(text: str, state: dict[str, Any], report: dict[str, Any],
     return problems
 
 
-def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str]) -> tuple[list[str], str]:
+def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str],
+                   unreported: list[str] | None = None) -> tuple[list[str], str]:
     """Every required check passed (when none are named: no check pending, failing or cancelled). Returns
-    (problems, note); `checks: null` in the project config means the project has no CI."""
+    (problems, note); `checks: null` in the project config means the project has no CI. A name listed more than
+    once (one run per PR event on the same head) passes when one entry passed and the rest were skipped. Given
+    an `unreported` list, a required check that has not reported is collected there instead of refused."""
     if not config["checks"]:
         return [], "no CI (project config sets checks to null)"
     used = set(PLACEHOLDER_RE.findall(config["checks"]))
@@ -1463,32 +1497,67 @@ def check_problems(repo: Path, config: dict[str, Any], values: dict[str, str]) -
     if not isinstance(rows, list) \
             or not all(isinstance(row, dict) and {"name", "bucket"} <= row.keys() for row in rows):
         return [f"cannot read checks from {shlex.join(argv)}: expected a list of {{name, bucket}}"], ""
+    required = config["required_checks"]
     if not rows:
+        if unreported is not None and required:  # ready_at_packet, packet time: a draft may run no CI at all
+            unreported.extend(required)
+            return [], ""
         return ["no checks reported; if the project has no CI, set checks to null in its config"], ""
-    required, buckets = config["required_checks"], [(str(row["name"]), str(row["bucket"]).lower()) for row in rows]
-    problems = [f"required check {name} has not reported" for name in required
-                if name not in {row for row, _ in buckets}]
-    for name, bucket in buckets:
-        if bucket not in CHECK_STATES:
-            problems.append(f"check {name} has an unknown state {bucket!r}")
-        elif name in required and bucket != "pass":
-            problems.append(f"required check {name} is {CHECK_STATES[bucket]}")
-        elif not required and bucket in ("fail", "pending", "cancel"):
-            problems.append(f"check {name} is {CHECK_STATES[bucket]}")
-    return problems, ""
+    head, entries = values.get("sha", ""), {}
+    for row in rows:  # `gh pr checks` reads only the head commit's rollup and has no sha field; when a custom
+        if "sha" in row and not head_sha(row["sha"], head):  # command lists one, count only the head's entries
+            continue
+        bucket = str(row["bucket"]).lower()
+        if "neutral" in (bucket, str(row.get("state", "")).lower()):  # gh's own bucket for neutral is skipping
+            bucket = "skipping"
+        entries.setdefault(str(row["name"]), []).append(bucket)
+    if not entries:
+        return [f"no checks reported for head {head[:12]}"], ""
+    missing = [name for name in required if name not in entries]
+    if unreported is not None:
+        unreported.extend(missing)
+    problems = [] if unreported is not None else [f"required check {name} has not reported" for name in missing]
+    notes = []
+    for name, states in entries.items():
+        unknown = [state for state in states if state not in CHECK_STATES]
+        if unknown:
+            problems.append(f"check {name} has an unknown state {unknown[0]!r}")
+        elif name in required:
+            if "pass" in states and set(states) <= {"pass", "skipping"}:
+                if len(states) > 1:
+                    notes.append(f"{name}: {states.count('pass')} passed, {states.count('skipping')} skipped")
+                continue
+            worst = next(state for state in ("fail", "cancel", "pending", "skipping") if state in states)
+            problems.append(f"required check {name} is {CHECK_STATES[worst]}")
+        elif not required:
+            worst = next((state for state in ("fail", "cancel", "pending") if state in states), None)
+            if worst:
+                problems.append(f"check {name} is {CHECK_STATES[worst]}")
+    return problems, "; ".join(notes)
 
 
-def pr_problems(repo: Path, project: str | None, pr: str, report: dict[str, Any]) -> tuple[list[str], str]:
-    """The PR head must be the local HEAD and its checks green; read-only commands only."""
-    config = project_config(repo, project, report["base_sha"])
+def head_sha(value: object, head: str) -> bool:
+    """A check entry's sha names the head when it is >= 7 lowercase hex characters and a prefix of it."""
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{7,64}", value)) and head.startswith(value)
+
+
+def pr_values(repo: Path, config: dict[str, Any], pr: str, report: dict[str, Any],
+              keys: tuple[str, ...] = ("pr_head", "checks")) -> dict[str, str]:
+    """The values the packet-time PR commands may use, checked against their sets before anything runs."""
     values = {"pr": pr, "sha": report["head_sha"], "patch_id": report["patch_id"],
               "head_ref": run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")}
-    used = {name for key in ("pr_head", "checks") if config[key] for name in PLACEHOLDER_RE.findall(config[key])}
+    used = {name for key in keys if config[key] for name in PLACEHOLDER_RE.findall(config[key])}
     bad = [f"{{{key}}}={values[key]!r}" for key in sorted(used & values.keys())
            if not re.fullmatch(VALUE_RES[key], values[key])]
     if bad or used - values.keys():
-        raise WorkflowError(f"refusing to run pr_head or checks: out-of-set values {', '.join(bad) or 'none'}; "
+        raise WorkflowError(f"refusing to run {' or '.join(keys)}: out-of-set values {', '.join(bad) or 'none'}; "
                             f"unavailable placeholders {', '.join(sorted(used - values.keys())) or 'none'}")
+    return values
+
+
+def pr_problems(repo: Path, config: dict[str, Any], values: dict[str, str],
+                unreported: list[str] | None = None) -> tuple[list[str], str]:
+    """The PR head must be the local HEAD and its checks green; read-only commands only."""
     problems = []
     try:
         if not config["pr_head"]:
@@ -1496,8 +1565,42 @@ def pr_problems(repo: Path, project: str | None, pr: str, report: dict[str, Any]
         check_pr_head(repo, render(config["pr_head"], values), values["sha"])
     except WorkflowError as exc:
         problems.append(str(exc))
-    found, note = check_problems(repo, config, values)
+    found, note = check_problems(repo, config, values, unreported)
     return problems + found, note
+
+
+def packet_pr_problems(repo: Path, project: str | None, pr: str, report: dict[str, Any],
+                       record: bool = False) -> tuple[list[str], str, dict[str, Any]]:
+    """packet-check --pr and record --pr: under ready_at_packet the PR is still a draft, so a required check that
+    has not reported yet (one that runs only once the PR is ready) is collected, not refused; approve checks all.
+    Returns (problems, note, context for mark_ready)."""
+    config = project_config(repo, project, report["base_sha"])
+    keys = ("pr_head", "checks", "pr_draft", "mark_ready") if record and config["ready_at_packet"] \
+        else ("pr_head", "checks")
+    values = pr_values(repo, config, pr, report, keys)
+    unreported: list[str] | None = [] if config["ready_at_packet"] else None
+    problems, note = pr_problems(repo, config, values, unreported)
+    if unreported:
+        note = "; ".join(filter(None, [note, "not reported yet, checked at approve: " + ", ".join(unreported)]))
+    return problems, note, {"config": config, "values": values, "unreported": unreported or None}
+
+
+def draft_state(repo: Path, argv: list[str]) -> tuple[bool, dict[str, Any]]:
+    """Run pr_draft; it must print true or false."""
+    done = run_command(repo, argv)
+    if done["stdout"].strip().lower() not in ("true", "false"):
+        raise WorkflowError(f"cannot read the draft state from {shlex.join(argv)}: {done['stdout'][:80]!r}")
+    return done["stdout"].strip().lower() == "true", done
+
+
+def ready_at_packet(repo: Path, context: dict[str, Any]) -> dict[str, Any]:
+    """After the packet check passed: take the PR out of draft (unless it already is) and re-check its head."""
+    config, values = context["config"], context["values"]
+    draft, read = draft_state(repo, render(config["pr_draft"], values))
+    done = [read] + ([run_command(repo, render(config["mark_ready"], values))] if draft else [])
+    check_pr_head(repo, render(config["pr_head"], values), values["sha"],
+                  "it moved after mark_ready; the PR is ready but the packet is not recorded")
+    return {"pr": values["pr"], "was_draft": draft, "commands": done, "at": utc_now()}
 
 
 def read_packet(path: Path) -> tuple[bytes, str]:
@@ -1515,7 +1618,7 @@ def cmd_packet_check(args: argparse.Namespace) -> int:
     report = evaluate(state, repo)
     problems, note = packet_problems(read_packet(Path(args.packet))[1], state, report), ""
     if args.pr:
-        found, note = pr_problems(repo, args.project, args.pr, report)
+        found, note, _ = packet_pr_problems(repo, args.project, args.pr, report)
         problems += found
     if problems:
         raise WorkflowError("packet-check refused, do not post:\n- " + "\n- ".join(problems))
@@ -1668,7 +1771,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "--marked-lines fit the budget")
     record.add_argument("--recorded-by", help="who records it: the subagent or person that produced the artifact, "
                         "at the moment it finished (e.g. implementer, cold-reader)")
-    record.add_argument("--pr", help="packet: also check the PR head and required checks, as packet-check --pr")
+    record.add_argument("--pr", help="packet: also check the PR head and required checks, as packet-check --pr; "
+                        "under the project's ready_at_packet, then mark the PR ready")
     record.add_argument("--project", help="packet: project config for --pr, as for approve")
     record.add_argument("--skip-packet-check", metavar="REASON", help="packet: record although packet-check "
                         "refuses; the reason and the refusals are stored and shown in status")
@@ -1676,8 +1780,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "once the branch is merged (its first-parent diff must match the approved patch)")
     record.set_defaults(handler=locked(cmd_record))
 
-    for name, handler, text in (("approve", cmd_approve, "check the PR head, set the approval status, mark the PR "
-                                 "ready and record the approval"),
+    for name, handler, text in (("approve", cmd_approve, "check the PR head and CI, mark the PR ready (under "
+                                 "ready_at_packet: check it is not a draft), set the approval status and record "
+                                 "the approval"),
                                 ("carry", cmd_carry, "after a rebase, carry the approval when only skip-read files "
                                  "changed, and re-set the approval status on the new head")):
         land = subparsers.add_parser(name, help=text)
