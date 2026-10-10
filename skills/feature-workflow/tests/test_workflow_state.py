@@ -941,7 +941,8 @@ class LandingTest(RepoCase):
 
     def grant(self, row: str = "D9", start: int = -60, end: int = 3600, *extra: str) -> list[str]:
         at, until = self.window(start, end)
-        return ["--grant", row, "--grant-at", at, "--grant-until", until, *extra]
+        patch = self.status()["patch_id"][:12]
+        return ["--grant", row, "--grant-at", at, "--grant-until", until, "--expect-patch", patch, *extra]
 
     def delegated_run(self) -> None:
         self.ready_for_approval()
@@ -986,6 +987,8 @@ class LandingTest(RepoCase):
              "--allow-skipped-packet-check is refused with --grant"),
             (self.grant(), "pass --grant-merges only if"),
             (self.grant("D9", -60, 3600, "--grant-at", "09:00"), "must be a UTC time"),
+            ([arg for arg in self.grant("D9", -60, 3600, "--grant-merges") if arg != "--expect-patch"][:-2]
+             + ["--grant-merges"], "--expect-patch is required with --grant"),
         ]
         for extra, message in cases:
             refused = self.land("approve", *extra)
@@ -998,18 +1001,48 @@ class LandingTest(RepoCase):
     def test_a_grant_is_pinned_on_first_use(self) -> None:
         self.ready_for_approval()
         at, until = self.window(-60, 3600)
-        first = ["--grant", "D9", "--grant-at", at, "--grant-until", until, "--grant-merges"]
+        patch = ["--expect-patch", self.status()["patch_id"][:12]]
+        first = ["--grant", "D9", "--grant-at", at, "--grant-until", until, "--grant-merges", *patch]
         self.assertEqual(self.land("approve", *first, "--dry-run").returncode, 0)  # a dry run pins nothing
         later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))
-        self.assertEqual(self.land("approve", *first[:5], later, "--grant-merges", "--dry-run").returncode, 0)
+        self.assertEqual(self.land("approve", *first[:5], later, "--grant-merges", *patch, "--dry-run").returncode, 0)
         self.assertEqual(self.land("approve", *first).returncode, 0)
-        extended = self.land("approve", "--grant", "D9", "--grant-at", at, "--grant-until", later, "--grant-merges")
+        extended = self.land("approve", "--grant", "D9", "--grant-at", at, "--grant-until", later, "--grant-merges",
+                             *patch)
         no_merge = self.workflow("approve", "--pr", "7", "--project", str(self.write_project(merge_mode="manual")),
-                                 "--grant", "D9", "--grant-at", at, "--grant-until", until, check=False)
+                                 "--grant", "D9", "--grant-at", at, "--grant-until", until, *patch, check=False)
         for refused in (extended, no_merge):
             self.assertIn(f"grant D9 is pinned to at {at} until {until} merges True", refused.stderr)
         common = Path(self.exec_cmd("git", "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
         self.assertEqual(json.loads((common / "feature-workflow" / "grants.json").read_text())["D9"]["until"], until)
+
+    def test_a_damaged_grants_file_refuses_cleanly(self) -> None:
+        self.ready_for_approval()
+        common = Path(self.exec_cmd("git", "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+        grants = common / "feature-workflow" / "grants.json"
+        grants.parent.mkdir(parents=True, exist_ok=True)
+        for damaged in ("{not json", "[]", '{"D9": {"row": "D9", "at": 1, "until": "x", "merges": true}}',
+                        '{"D8": {"row": "D9", "at": "a", "until": "b", "merges": false}}'):
+            grants.write_text(damaged, encoding="utf-8")
+            refused = self.land("approve", *self.grant("D9", -60, 3600, "--grant-merges"))
+            self.assertEqual(refused.returncode, 1, damaged)
+            self.assertIn(f"damaged grants file {grants}", refused.stderr, damaged)
+            self.assertNotIn("Traceback", refused.stderr)
+        grants.unlink()
+        self.assertEqual(self.land("approve", *self.grant("D9", -60, 3600, "--grant-merges")).returncode, 0)
+        self.assertEqual(sorted(path.name for path in grants.parent.iterdir() if path.name.startswith("grants")),
+                         ["grants.json"])  # written through a temp file that is gone
+
+    def test_a_delegated_approval_covers_at_most_150_changed_lines(self) -> None:
+        self.ready_for_approval()
+        self.commit("tests/fixtures/big.json", "".join(f"{n}\n" for n in range(150)), "fixture")  # t0 skip-read
+        for name in ("build", "verification", "cold-read", "packet"):
+            self.record(name)
+        self.publish_head()
+        refused = self.land("approve", *self.grant("D9", -60, 3600, "--grant-merges"))
+        self.assertIn("at most 150 changed lines in all; this patch changes 151", refused.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.land("approve", "--approver", "ann").returncode, 0)  # the human may still approve
 
     def test_reserved_and_non_ascii_approvers_are_refused(self) -> None:
         self.ready_for_approval()

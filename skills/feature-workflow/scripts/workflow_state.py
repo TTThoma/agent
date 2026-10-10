@@ -73,6 +73,7 @@ VALUE_RES = {"pr": "[0-9]+", "sha": "[0-9a-f]{40,64}", "patch_id": "[0-9a-f]{40,
              "approver": r"[A-Za-z0-9_(][A-Za-z0-9_ .:()'-]*", "head_ref": "[A-Za-z0-9._/][A-Za-z0-9._/-]*"}
 GRANT_ROW_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 GRANT_MAX_SECONDS = 12 * 3600  # the longest delegation window (references/delegation.md)
+DELEGATION_MAX_LINES = 150  # changed lines in all, every tier (delegation rubric item 4)
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh")  # a convenience denylist; VALUE_RES is the guard
 IN_TREE_PROJECT = ".feature-workflow/project.json"
 CARRIED = ("cold-read", "packet", "approval")  # patch-bound records a carry moves to the new patch
@@ -1120,7 +1121,36 @@ def grant_request(args: argparse.Namespace, config: dict[str, Any]) -> dict[str,
     if config["merge_mode"] == "bot" and not args.grant_merges:
         raise WorkflowError("under merge_mode: bot approving merges; pass --grant-merges only if the human's grant "
                             "said it includes merging")
+    if args.expect_patch is None:
+        raise WorkflowError("--expect-patch is required with --grant: name the patch id the grant's rubric was "
+                            "checked on")
     return {"row": args.grant, "at": iso(at), "until": iso(until), "merges": bool(args.grant_merges)}
+
+
+def changed_lines(repo: Path, base_sha: str, head_sha: str) -> int:
+    """Additions plus deletions over every file, whatever its tier; a binary file counts its old and new lines."""
+    total = 0
+    for added, deleted, path, old_path in numstat(repo, base_sha, head_sha):
+        if added == "-":
+            total += blob_lines(repo, base_sha, old_path or path) + blob_lines(repo, head_sha, path)
+        else:
+            total += int(added) + int(deleted)
+    return total
+
+
+def load_grants(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        grants = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"damaged grants file {path}: {exc}") from exc
+    shape = {"row": str, "at": str, "until": str, "merges": bool}
+    if not isinstance(grants, dict) or not all(
+            isinstance(grant, dict) and set(grant) == set(shape) and grant["row"] == row
+            and all(type(grant[key]) is kind for key, kind in shape.items()) for row, grant in grants.items()):
+        raise WorkflowError(f"damaged grants file {path}: expected {{row: {{row, at, until, merges}}}}")
+    return grants
 
 
 def pin_grant(repo: Path, grant: dict[str, Any], write: bool) -> None:
@@ -1128,7 +1158,7 @@ def pin_grant(repo: Path, grant: dict[str, Any], write: bool) -> None:
     common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     path = common / "feature-workflow" / "grants.json"
     with ledger_lock(path):
-        grants = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        grants = load_grants(path)
         pinned = grants.get(grant["row"])
         if pinned is not None:
             if pinned != grant:
@@ -1137,7 +1167,15 @@ def pin_grant(repo: Path, grant: dict[str, Any], write: bool) -> None:
             return
         if write:
             grants[grant["row"]] = grant
-            path.write_text(json.dumps(grants, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            fd, temporary = tempfile.mkstemp(prefix="grants.", suffix=".json", dir=path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(grants, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
 
 
 def landing_plan(repo: Path, args: argparse.Namespace, report: dict[str, Any], approver: str,
@@ -1212,6 +1250,10 @@ def cmd_approve(args: argparse.Namespace) -> int:
         raise WorkflowError(f"the packet was recorded with --skip-packet-check ({skipped}); re-record it, or pass "
                             "--allow-skipped-packet-check")
     if grant:
+        total = changed_lines(repo, report["base_sha"], report["head_sha"])
+        if total > DELEGATION_MAX_LINES:
+            raise WorkflowError(f"a delegated approval covers at most {DELEGATION_MAX_LINES} changed lines in all; "
+                                f"this patch changes {total}: it waits for the human")
         pin_grant(repo, grant, write=not args.dry_run)
     plan = landing_plan(repo, args, report, approver, ("mark_ready", "approval_status"))
     if plan is None:

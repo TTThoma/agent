@@ -37,7 +37,7 @@ A template is split with `shlex` first and then filled per argument, so no value
 - **`workflow_state.py approve --slug S --pr N (--approver NAME | --grant ROW --grant-at T --grant-until T [--grant-merges]) [--expect-patch ID] [--evidence-url URL] [--dry-run]`**
   - Works for every tier; a T0 run needs only build, verification and packet current.
   - `--approver` is ASCII, and a name starting with `delegated` or holding `delegated:` is refused. `--expect-patch` refuses unless the current patch id starts with the id the human was shown.
-  - `--grant` records a delegated approval as `delegated:<session>`, checked against the grant's window and pinned repo-wide ([delegation.md](delegation.md)).
+  - `--grant` records a delegated approval as `delegated:<session>`; it needs `--expect-patch`, refuses over 150 changed lines, and is checked against the grant's window and pinned repo-wide ([delegation.md](delegation.md)).
   - Refuses unless the run is open, the patch is not empty, every artifact before approval is current, no gate blocks approval, the worktree is clean, the patch leaves `.feature-workflow/` alone, and `pr_head` equals the local HEAD.
   - Runs `mark_ready`, checks `pr_head` again, and then takes the ledger lock. Under the lock it re-loads and re-evaluates the run, refusing if approval is no longer allowed on the same head and patch. Only then does it run `approval_status` and record `approval`, with the approver, patch id, PR, project config, `merge_mode`, `required_checks`, and each command's argv and output.
   - On a failure before `approval_status`, no approval status is left behind. If `approval_status` itself fails, nothing is recorded except an `approval_attempts` entry, which never counts as an approval.
